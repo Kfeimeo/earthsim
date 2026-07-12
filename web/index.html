@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EarthSim · 地球天气模拟</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<canvas id="globe"></canvas>
+
+<header id="hud-top">
+  <div class="brand">EARTH<span>SIM</span></div>
+  <div class="clock mono" id="sim-clock">----:--:-- --:--</div>
+  <div class="badges">
+    <span class="badge" id="badge-mode">…</span>
+    <span class="badge" id="badge-backend">…</span>
+  </div>
+</header>
+
+<aside id="panel-layers">
+  <div class="panel-title">数据图层</div>
+  <div id="layer-list"></div>
+  <div class="panel-title" style="margin-top:14px">叠加</div>
+  <label class="toggle"><input type="checkbox" id="tg-cloud" checked><span>云层覆盖</span></label>
+  <label class="toggle"><input type="checkbox" id="tg-ice" checked><span>冰雪覆盖</span></label>
+  <label class="toggle"><input type="checkbox" id="tg-wind"><span>风场</span></label>
+  <div class="flow-controls" id="wind-flow-controls">
+    <select id="wind-mode">
+      <option value="vector">矢量图</option>
+      <option value="streamline">流线图</option>
+    </select>
+    <div class="flow-density">
+      <span>密度</span><input type="range" id="wind-density" min="1" max="10" step="1"><span class="mono" id="wind-density-label"></span>
+    </div>
+  </div>
+  <label class="toggle"><input type="checkbox" id="tg-ocean"><span>洋流</span></label>
+  <div class="flow-controls" id="ocean-flow-controls">
+    <select id="ocean-mode">
+      <option value="vector">矢量图</option>
+      <option value="streamline">流线图</option>
+    </select>
+    <div class="flow-density">
+      <span>密度</span><input type="range" id="ocean-density" min="1" max="10" step="1"><span class="mono" id="ocean-density-label"></span>
+    </div>
+  </div>
+  <label class="toggle"><input type="checkbox" id="tg-night" checked><span>昼夜明暗</span></label>
+  <div id="legend">
+    <canvas id="legend-bar" width="160" height="10"></canvas>
+    <div class="legend-labels mono"><span id="legend-min"></span><span id="legend-name"></span><span id="legend-max"></span></div>
+  </div>
+  <div id="edit-panel" class="live-only hidden">
+    <div class="panel-title" style="margin-top:14px">温度编辑</div>
+    <button id="btn-edit" class="layer-btn">🖌 进入编辑模式</button>
+    <div class="edit-row"><span>幅度</span><input type="range" id="edit-delta" min="-100" max="20" step="1" value="8"><span class="mono" id="edit-delta-label">+8°C</span></div>
+    <div class="edit-row"><span>半径</span><input type="range" id="edit-radius" min="200" max="4000" step="100" value="1000"><span class="mono" id="edit-radius-label">1000km</span></div>
+    <div class="edit-row"><span>作用</span>
+      <select id="edit-target">
+        <option value="both">地表+大气</option>
+        <option value="surface">仅地表/海面</option>
+        <option value="air">仅大气</option>
+      </select>
+    </div>
+  </div>
+</aside>
+
+<div id="analysis-card" class="hidden">
+  <button id="card-close">×</button>
+  <div class="card-head">
+    <div class="card-icon" id="card-icon">☀️</div>
+    <div>
+      <div class="card-weather" id="card-weather">晴</div>
+      <div class="card-coord mono" id="card-coord"></div>
+    </div>
+  </div>
+  <div class="card-grid mono" id="card-grid"></div>
+</div>
+
+<footer id="transport">
+  <button id="btn-back" title="上一帧" class="pb-only hidden">⏮</button>
+  <button id="btn-play" title="播放/暂停">⏸</button>
+  <button id="btn-step" title="逐帧前进">⏭</button>
+  <div class="speed">
+    <span class="mono" id="speed-label">×1.0</span>
+    <input type="range" id="speed" min="-2" max="3" step="0.25" value="0">
+  </div>
+  <input type="range" id="timeline" min="0" max="0" value="0" class="pb-only hidden">
+  <span class="mono pb-only hidden" id="frame-label"></span>
+</footer>
+
+<div id="hint">拖动旋转 · 滚轮缩放 · 点击地表查看天气</div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

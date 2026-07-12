@@ -1,0 +1,75 @@
+# ============================================================
+# EarthSim 全局配置文件
+# 所有物理 / 数值 / 服务器超参数都在这里调节
+# ============================================================
+
+backend: cuda            # auto | cuda | cpu   (cuda 需要安装 cupy)
+
+grid:
+  nlat: 360               # 纬向格点数 (2° 分辨率)。提高精度: 180 (1°), 360 (0.5°)
+  nlon: 720              # 经向格点数,一般取 nlat*2
+  topo_file: data/etopo20.npz   # 真实地形 (ETOPO 20')
+
+time:
+  dt: 240                # 物理时间步长(秒)。分辨率提高时需按比例减小 (CFL)
+  start: "2026-05-01T00:00:00"  # 模拟起始时刻(决定季节与昼夜)
+  spinup_days: 0         # 启动时先静默积分的天数(让环流成型), 例如 5
+
+physics:
+  # ---- 模型选择开关 ----
+  moisture: true         # 水汽循环(蒸发/凝结/降水/潜热)
+  radiation: true        # 太阳短波 + 长波辐射(含昼夜与季节)
+  ocean: true            # 平板海洋 + 风生洋流
+  ice_albedo: true       # 冰雪反照率反馈
+  diurnal_cycle: true    # 昼夜循环(关闭则使用日平均入射)
+
+  # ---- 动力学 ----
+  H0: 800.0              # 等效大气厚度 (m) —— 决定重力波速 sqrt(g_eff*H0)
+  g_eff: 9.8             # 有效重力 (m/s^2)
+  beta_T: 22.0           # 热力强迫系数 (m/K): 暖区 -> 低压
+  tau_h: 43200.0         # 厚度场向热力平衡弛豫时间 (s)
+  drag: 6.0e-6           # 地面摩擦 (1/s)
+  visc: 8.0e+4            # 动量水平扩散 (m^2/s)
+  diff_T: 4.0e+4          # 温度扩散
+  diff_q: 4.0e+4          # 水汽扩散
+  umax: 50            # 风速限幅 (m/s)
+
+  # ---- 辐射 ----
+  S0: 1361.0             # 太阳常数 (W/m^2)
+  alb_ocean: 0.07
+  alb_land: 0.22
+  alb_ice: 0.62
+  alb_snow: 0.70
+  alb_cloud: 0.42        # 云反照率贡献 (乘以云量)
+  tau_relax_T: 864000.0  # 大气温度向辐射平衡弛豫 (s) —— 保底约束, 10 天
+
+  # ---- 水汽 ----
+  rh_crit: 0.85          # 凝结临界相对湿度
+  tau_cond: 3600.0       # 凝结时间尺度 (s)
+  c_evap: 1.3e-3         # 蒸发系数
+  land_evap: 0.25        # 陆面蒸发相对海面的比例
+
+  # ---- 海洋 ----
+  mld: 40.0              # 海洋混合层深度 (m), 决定海洋热惯性
+  tau_ocean: 8.0e-7      # 风应力 -> 洋流 传递系数
+  drag_ocean: 1.5e-6     # 洋流阻尼
+  visc_ocean: 4.0e+4      # 洋流扩散
+
+numerics:
+  advection: upwind      # 平流格式 (目前: upwind)
+  cos_clamp: 0.02         # 高纬 cos(lat) 下限(防极点奇异)
+  polar_filter_lat: 88.0 # 该纬度以上启用纬向滤波
+  polar_filter_passes: 6
+
+# 离线预演算(先算好再回放, 精度可以开高)
+precompute:
+  out_dir: output/run1
+  days: 3                # 演算总天数
+  save_every_steps: 15   # 每多少步存一帧 (15*240s = 1h/帧)
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  steps_per_frame: 3     # 实时模式下每推送一帧走多少物理步
+  max_fps: 10            # 推送帧率上限
+  vector_stride: 5       # 风场/洋流矢量抽稀间隔
