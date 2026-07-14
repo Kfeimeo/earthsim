@@ -1,15 +1,21 @@
-"""真实地球地形 (ETOPO 20 弧分, 来自 matplotlib/basemap 官方数据)。
+"""Global topography helpers.
 
-- load_topo(): 读取 npz 并重采样到模拟网格, 生成陆海掩膜
-- make_base_texture(): 生成用于 UI 的地形底图 PNG (含简单晕渲)
-若数据缺失, scripts/get_topo.py 可重新下载; 也提供程序化退化地形。
+The model stores terrain as compressed ``npz`` files with three arrays:
+``topo`` in meters, ``lats`` in degrees, and ``lons`` in degrees.  When a
+configuration uses ``topo_file: auto`` or ``topo_files: [...]``, the highest
+resolution available file is selected at startup.
 """
+from __future__ import annotations
+
+import glob
 import os
+from pathlib import Path
+
 import numpy as np
 
 
 def sim_grid(nlat, nlon):
-    """格点中心经纬度。行 0 = 南, 经度 0..360。"""
+    """Cell-centre latitude/longitude. Row 0 is south, longitude is 0..360."""
     dlat = 180.0 / nlat
     dlon = 360.0 / nlon
     lats = -90.0 + dlat * (np.arange(nlat) + 0.5)
@@ -17,52 +23,139 @@ def sim_grid(nlat, nlon):
     return lats, lons
 
 
-def load_topo(path, nlat, nlon):
-    """返回 (elev[nlat,nlon] 米, land_mask[nlat,nlon] 0/1)。"""
-    if path and os.path.exists(path):
-        z = np.load(path)
-        topo, tlats, tlons = z["topo"], z["lats"], z["lons"]
-        tlons = np.mod(tlons, 360.0)
-        order = np.argsort(tlons)
-        # 去掉重复经度列
-        tlons, uniq = np.unique(tlons[order], return_index=True)
-        topo = topo[:, order][:, uniq]
-        if tlats[0] > tlats[-1]:
-            tlats, topo = tlats[::-1], topo[::-1]
-        lats, lons = sim_grid(nlat, nlon)
-        li = np.clip(np.searchsorted(tlats, lats), 0, len(tlats) - 1)
-        lj = np.clip(np.searchsorted(tlons, lons), 0, len(tlons) - 1)
-        # 面积平均降采样(块平均), 网格粗于源数据时更平滑
-        fy, fx = topo.shape[0] // nlat, topo.shape[1] // nlon
-        if fy >= 2 and fx >= 2:
-            ty, tx = nlat * fy, nlon * fx
-            t = topo[:ty, :tx].reshape(nlat, fy, nlon, fx).mean(axis=(1, 3))
-            elev = t
+def _repo_data_dir():
+    return Path(__file__).resolve().parent.parent / "data"
+
+
+def _flatten_spec(spec):
+    if spec is None:
+        return []
+    if isinstance(spec, (list, tuple)):
+        out = []
+        for item in spec:
+            out.extend(_flatten_spec(item))
+        return out
+    text = str(spec).strip()
+    return [text] if text else []
+
+
+def _auto_candidates():
+    dirs = [Path.cwd() / "data", _repo_data_dir()]
+    seen_dirs = set()
+    out = []
+    for data_dir in dirs:
+        key = str(data_dir.resolve()) if data_dir.exists() else str(data_dir)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        for pat in ("etopo*.npz", "topo*.npz"):
+            out.extend(Path(p) for p in glob.glob(str(data_dir / pat)))
+    return out
+
+
+def _candidate_paths(spec):
+    out = []
+    for item in _flatten_spec(spec):
+        if item.lower() == "auto":
+            out.extend(_auto_candidates())
+        elif any(ch in item for ch in "*?[]"):
+            out.extend(Path(p) for p in glob.glob(item))
         else:
-            elev = topo[np.ix_(li, lj)]
-        return elev.astype(np.float32), (elev > 0).astype(np.float32)
-    # ---- 退化: 程序化近似大陆(仅在没有数据文件时) ----
+            out.append(Path(item))
+
+    deduped = []
+    seen = set()
+    for path in out:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(path)
+    return deduped
+
+
+def _topo_rank(path):
+    try:
+        with np.load(path) as z:
+            shape = tuple(z["topo"].shape)
+    except Exception:
+        return (-1, str(path))
+    cells = int(np.prod(shape))
+    return (cells, str(path))
+
+
+def resolve_topo_path(spec):
+    """Return the best existing topography file for a string/list spec."""
+    existing = [p for p in _candidate_paths(spec) if p.exists()]
+    if not existing:
+        return None
+    return str(max(existing, key=_topo_rank))
+
+
+def _read_topo(path):
+    with np.load(path) as z:
+        return (np.asarray(z["topo"], dtype=np.float32),
+                np.asarray(z["lats"], dtype=np.float64),
+                np.asarray(z["lons"], dtype=np.float64))
+
+
+def _resample_topo(topo, tlats, tlons, nlat, nlon):
+    tlons = np.mod(np.asarray(tlons, dtype=np.float64), 360.0)
+    order = np.argsort(tlons)
+    tlons, uniq = np.unique(tlons[order], return_index=True)
+    topo = np.asarray(topo, dtype=np.float32)[:, order][:, uniq]
+    if tlats[0] > tlats[-1]:
+        tlats, topo = tlats[::-1], topo[::-1]
+
     lats, lons = sim_grid(nlat, nlon)
-    LA, LO = np.meshgrid(lats, lons, indexing="ij")
-    elev = -3000 + 3500 * (np.sin(np.radians(LO) * 1.5) *
-                           np.cos(np.radians(LA) * 2) > 0.3)
-    return elev.astype(np.float32), (elev > 0).astype(np.float32)
+    lon_ext = np.concatenate(([tlons[-1] - 360.0], tlons,
+                              [tlons[0] + 360.0]))
+    topo_ext = np.concatenate((topo[:, -1:], topo, topo[:, :1]), axis=1)
+    qlon = np.asarray(lons, dtype=np.float64)
+    qlon = np.where(qlon < lon_ext[0], qlon + 360.0, qlon)
+    qlon = np.where(qlon > lon_ext[-1], qlon - 360.0, qlon)
+    along = np.stack([np.interp(qlon, lon_ext, row)
+                      for row in topo_ext], axis=0)
+    elev = np.stack([np.interp(lats, tlats, along[:, j])
+                     for j in range(nlon)], axis=1)
+    return elev.astype(np.float32)
+
+
+def _procedural_topo(nlat, nlon):
+    lats, lons = sim_grid(nlat, nlon)
+    la, lo = np.meshgrid(lats, lons, indexing="ij")
+    elev = -3000 + 3500 * (np.sin(np.radians(lo) * 1.5) *
+                           np.cos(np.radians(la) * 2) > 0.3)
+    return elev.astype(np.float32)
+
+
+def load_topo(path, nlat, nlon):
+    """Return ``(elev[nlat,nlon], land_mask[nlat,nlon])``."""
+    resolved = resolve_topo_path(path)
+    if resolved:
+        topo, tlats, tlons = _read_topo(resolved)
+        elev = _resample_topo(topo, tlats, tlons, nlat, nlon)
+        return elev, (elev > 0).astype(np.float32)
+
+    elev = _procedural_topo(nlat, nlon)
+    return elev, (elev > 0).astype(np.float32)
 
 
 def make_base_texture(topo_path, out_png, width=1080):
-    """由原始 ETOPO 生成地形底图 PNG (北在上)。"""
+    """Create the UI base-map PNG from the best available terrain file."""
     from PIL import Image
-    z = np.load(topo_path)
-    topo, tlats = z["topo"], z["lats"]
-    tlons = np.mod(z["lons"], 360.0)
-    order = np.argsort(tlons)
-    _, uniq = np.unique(tlons[order], return_index=True)
-    topo = topo[:, order][:, uniq]
-    if tlats[0] > tlats[-1]:
-        topo = topo[::-1]
-    h, w = topo.shape
-    img = np.zeros((h, w, 3), np.float32)
 
+    resolved = resolve_topo_path(topo_path)
+    if resolved:
+        topo, tlats, tlons = _read_topo(resolved)
+        h = int(round(width / 2)) if width else topo.shape[0]
+        w = int(width) if width else topo.shape[1]
+        topo = _resample_topo(topo, tlats, tlons, h, w)
+    else:
+        w = int(width or 1080)
+        h = max(1, int(round(w / 2)))
+        topo = _procedural_topo(h, w)
+
+    img = np.zeros((*topo.shape, 3), np.float32)
     ocean = topo <= 0
     d = np.clip(-topo / 6000.0, 0, 1) ** 0.5
     img[ocean] = (np.stack([0.09 - 0.05 * d, 0.22 - 0.12 * d,
@@ -75,14 +168,10 @@ def make_base_texture(topo_path, out_png, width=1080):
     land_col = lo * (1 - t) + hi * t
     img[~ocean] = land_col[~ocean]
 
-    # 简单东西向晕渲
     shade = np.clip((np.roll(topo, 1, 1) - topo) / 800.0, -0.5, 0.5)
     img *= (1.0 + 0.35 * shade[..., None] * (~ocean)[..., None])
 
-    img = (np.clip(img, 0, 1)[::-1] * 255).astype(np.uint8)  # 北在上
-    im = Image.fromarray(img)
-    if width and width != w:
-        im = im.resize((width, int(width * h / w)), Image.LANCZOS)
+    img = (np.clip(img, 0, 1)[::-1] * 255).astype(np.uint8)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
-    im.save(out_png)
+    Image.fromarray(img).save(out_png)
     return out_png

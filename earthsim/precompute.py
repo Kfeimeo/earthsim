@@ -26,12 +26,14 @@ def run_precompute(cfg, days=None, progress=True):
     manifest = {
         "grid": {"nlat": model.nlat, "nlon": model.nlon},
         "dt": model.dt, "save_every_steps": save_every,
-        "backend": model.backend, "times": [],
+        "backend": model.backend,
+        "atmosphere_levels_m": model.levels_m.tolist(),
+        "times": [],
     }
     t0 = time.time()
     for k in range(nframes):
         model.step(save_every)
-        f = model.fields_cpu()
+        f = model.fields_cpu(include_layers=True)
         np.savez_compressed(
             os.path.join(frames_dir, f"frame_{k:06d}.npz"),
             **{key: v.astype(np.float32) for key, v in f.items()},

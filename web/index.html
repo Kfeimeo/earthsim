@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>EarthSim · 地球天气模拟</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=ui4">
 </head>
 <body>
 <canvas id="globe"></canvas>
@@ -30,6 +30,9 @@
       <option value="vector">矢量图</option>
       <option value="streamline">流线图</option>
     </select>
+    <div class="flow-layer" id="wind-layer-row">
+      <span>高度</span><select id="wind-layer"></select>
+    </div>
     <div class="flow-density">
       <span>密度</span><input type="range" id="wind-density" min="1" max="10" step="1"><span class="mono" id="wind-density-label"></span>
     </div>
@@ -77,6 +80,8 @@
 </div>
 
 <footer id="transport">
+  <button id="btn-reset" class="live-only" title="&#37325;&#32622;&#21040;&#21021;&#22987;&#29366;&#24577;" aria-label="&#37325;&#32622;&#21040;&#21021;&#22987;&#29366;&#24577;">↺</button>
+  <button id="btn-record" class="live-only recording" title="&#20572;&#27490;&#35760;&#24405;" aria-label="&#35760;&#24405;&#28436;&#31639;&#32467;&#26524;" aria-pressed="true">●</button>
   <button id="btn-back" title="上一帧" class="pb-only hidden">⏮</button>
   <button id="btn-play" title="播放/暂停">⏸</button>
   <button id="btn-step" title="逐帧前进">⏭</button>
@@ -90,6 +95,6 @@
 
 <div id="hint">拖动旋转 · 滚轮缩放 · 点击地表查看天气</div>
 
-<script type="module" src="/static/app.js"></script>
+<script type="module" src="/static/app.js?v=ui4"></script>
 </body>
 </html>

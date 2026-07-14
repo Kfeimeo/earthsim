@@ -3,11 +3,12 @@
 所有函数以 xp (numpy 或 cupy) 数组编写, CPU/GPU 共用一份代码;
 在 CUDA 后端下, 标量平流+扩散走 kernels.cu 的手写融合 kernel。
 
-模型: 单层湿浅水大气 + 平板海洋
-  u, v   风场 (m/s)
-  h      等效厚度/位势 (m), 兼作气压场 (暖->低压 热力强迫)
-  Ta     近地面气温 (K)
-  q      比湿 (kg/kg)
+模型: 多层湿浅水大气 + 平板海洋
+  u, v   各高度层水平风场 (m/s)
+  w      垂直速度 (m/s)，由质量连续、浮力和地形抬升共同驱动
+  h      各层等效厚度/位势 (m), 兼作气压场 (暖->低压 热力强迫)
+  Ta     各高度层气温 (K)
+  q      各高度层比湿 (kg/kg)
   Ts     下垫面温度 (海表 SST / 陆面) (K)
   uo, vo 洋流 (m/s)
 诊断量: cloud(云量), precip(降水 mm/h), ice/snow, rh
@@ -57,6 +58,7 @@ class Ops:
             if cuda_kernels.load():
                 self.cuda_adv = cuda_kernels
                 self.invdx_flat = self.invdx[:, 0].copy()
+                self.pf_w_flat = self.pf_w[:, 0].copy()
 
     # ---------- 基础算子 ----------
     def rollx(self, F, k):
@@ -97,10 +99,15 @@ class Ops:
 
     def polar_filter(self, F):
         """高纬纬向 1-2-1 平滑, 抑制极点数值噪声。"""
+        if self.cuda_adv is not None:
+            return self.cuda_adv.polar_filter(F, self.pf_w_flat,
+                                              self.pf_passes)
         s = F
         for _ in range(self.pf_passes):
-            s = 0.25 * self.rollx(s, 1) + 0.5 * s + 0.25 * self.rollx(s, -1)
-        return F + self.pf_w * (s - F)
+            s = (0.25 * self.xp.roll(s, 1, axis=-1) + 0.5 * s
+                 + 0.25 * self.xp.roll(s, -1, axis=-1))
+        weight_shape = (1,) * (F.ndim - 2) + (self.nlat, 1)
+        return F + self.pf_w.reshape(weight_shape) * (s - F)
 
     def coriolis_rotate(self, u, v, dt):
         """科氏力: 精确旋转(无条件稳定)。北半球向右偏转。"""

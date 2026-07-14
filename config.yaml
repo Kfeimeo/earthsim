@@ -7,13 +7,29 @@ backend: cuda            # auto | cuda | cpu   (cuda 需要安装 cupy)
 
 grid:
   nlat: 360               # 纬向格点数 (2° 分辨率)。提高精度: 180 (1°), 360 (0.5°)
-  nlon: 720              # 经向格点数,一般取 nlat*2
-  topo_file: data/etopo20.npz   # 真实地形 (ETOPO 20')
+  nlon: 720             # 经向格点数,一般取 nlat*2
+  topo_file: data/etopo2022_60s.npz   # 当前可用的 ETOPO 2022 60" 地形
+
+  topo_files:
+    - data/etopo2022_60s.npz
+    - data/etopo20.npz
 
 time:
-  dt: 240                # 物理时间步长(秒)。分辨率提高时需按比例减小 (CFL)
-  start: "2026-05-01T00:00:00"  # 模拟起始时刻(决定季节与昼夜)
-  spinup_days: 0         # 启动时先静默积分的天数(让环流成型), 例如 5
+  dt: 30
+  start: "2026-05-01T00:00:00"
+  spinup_days: 0
+
+data:
+  # real: 文件存在且必须成功；auto: 文件存在时真实初始化，否则使用理想场
+  init_mode: ideal
+
+
+  # 推荐将 ERA5 压力层和单层文件放在这里；也可以把二者合并成一个 NetCDF
+  atmosphere_file: data/era5_pressure_levels.nc
+  surface_file: data/era5_single_levels.nc
+  # 可选：Copernicus Marine/CMEMS 海表流速与海温 NetCDF
+  ocean_file: data/cmems_surface_currents.nc
+  init_time: ""       # 空值表示使用 time.start，按最近时次选择
 
 physics:
   # ---- 模型选择开关 ----
@@ -24,15 +40,17 @@ physics:
   diurnal_cycle: true    # 昼夜循环(关闭则使用日平均入射)
 
   # ---- 动力学 ----
-  H0: 800.0              # 等效大气厚度 (m) —— 决定重力波速 sqrt(g_eff*H0)
+  H0: 8000.0              # 等效大气厚度 (m) —— 决定重力波速 sqrt(g_eff*H0)
   g_eff: 9.8             # 有效重力 (m/s^2)
   beta_T: 22.0           # 热力强迫系数 (m/K): 暖区 -> 低压
   tau_h: 43200.0         # 厚度场向热力平衡弛豫时间 (s)
-  drag: 6.0e-6           # 地面摩擦 (1/s)
+  drag: 6.0e-6           # 旧版统一大气摩擦回退值 (1/s)
+  drag_ocean_atmosphere: 4.0e-6 # 海洋上空近地层大气摩擦 (1/s)
+  drag_land_atmosphere: 1.2e-5 # 陆地上空近地层大气摩擦 (1/s)
   visc: 8.0e+4            # 动量水平扩散 (m^2/s)
   diff_T: 4.0e+4          # 温度扩散
-  diff_q: 4.0e+4          # 水汽扩散
-  umax: 50            # 风速限幅 (m/s)
+  diff_q: 2.0e+4          # 水汽扩散
+  umax: 150            # 风速限幅 (m/s)
 
   # ---- 辐射 ----
   S0: 1361.0             # 太阳常数 (W/m^2)
@@ -44,21 +62,86 @@ physics:
   tau_relax_T: 864000.0  # 大气温度向辐射平衡弛豫 (s) —— 保底约束, 10 天
 
   # ---- 水汽 ----
-  rh_crit: 0.85          # 凝结临界相对湿度
-  tau_cond: 3600.0       # 凝结时间尺度 (s)
-  c_evap: 1.3e-3         # 蒸发系数
-  land_evap: 0.25        # 陆面蒸发相对海面的比例
+  rh_crit: 0.90          # 凝结临界相对湿度
+  tau_cond: 5400.0       # 凝结时间尺度 (s)
+  c_evap: 9.0e-4         # 蒸发系数
+  convective_rh_drop_max: 0.12 # 辐合最多降低的凝结 RH 阈值
+  convective_div_scale: 3.0e-5 # 达到最大对流增强所需的辐合强度 (1/s)
+  cloud_rh_start: 0.70   # 诊断云开始形成的相对湿度
+  cloud_rh_full: 0.95    # 诊断云接近满云的相对湿度
+  cloud_rh_exponent: 1.6 # 云量随 RH 增长的非线性指数
+  tau_cloud_form: 1800.0  # 云量向诊断云形成的时间尺度 (s)
+  tau_cloud_dissip: 3000.0 # 无支撑云量的基础耗散时间尺度 (s)
+  cloud_clear_rh: 0.72   # 低于该相对湿度时增强云耗散
+  cloud_dry_clear: 4.0   # 干燥清除增强倍数
+  cloud_subsidence_clear: 3.0 # 下沉/辐散清除增强倍数
+  cloud_precip_clear: 2 # 降水雨洗清除增强倍数
+  cloud_precip_scale: 0.5 # 雨洗归一化降水强度 (mm/h)
+  init_surface_rh: 0.58  # 理想初始场近地层相对湿度
+  init_upper_rh: 0.28    # 理想初始场高层相对湿度
+  ideal_wave_amp_K: 1.2  # 理想初始场温度扰动, 打破经向均匀
+  ideal_humidity_wave: 0.10 # 理想初始场湿度扰动比例
+  land_evap: 0.05        # 陆面蒸发相对海面的比例
+
+    # ---- 初始风场 ----
+  ideal_wind_enabled: true # ideal 初始化时启用先验风场
+  ideal_trade_wind_ms: 5.0 # 热带近地层东风强度
+  ideal_surface_westerly_ms: 4.0 # 中纬近地层西风强度
+  ideal_jet_ms: 22.0      # 中纬高空西风急流强度
+  ideal_polar_easterly_ms: 2.5 # 极地低层东风强度
+  ideal_jet_lat_deg: 42.0 # 西风急流中心纬度
+  ideal_jet_width_deg: 12.0 # 西风急流纬向宽度
+  ideal_jet_height_m: 9000.0 # 西风急流中心高度
+  ideal_jet_depth_m: 4500.0 # 西风急流垂直厚度
+  ideal_wind_wave_ms: 1.2 # 天气尺度扰动风, 加速形成错落结构
+
 
   # ---- 海洋 ----
   mld: 40.0              # 海洋混合层深度 (m), 决定海洋热惯性
   tau_ocean: 8.0e-7      # 风应力 -> 洋流 传递系数
   drag_ocean: 1.5e-6     # 洋流阻尼
   visc_ocean: 4.0e+4      # 洋流扩散
+  ocean_layers:
+    enabled: true          # two active ocean layers; mld remains the upper-layer depth
+    lower_depth_m: 200.0   # deep-layer thickness (m)
+    deep_initial_offset_k: 1.5 # initial deep water temperature below SST (K)
+    interlayer_drag: 2.0e-7 # upper/deep momentum exchange (1/s)
+    interlayer_heat_exchange: 1.0e-7 # upper/deep heat exchange (1/s)
+    deep_drag: 3.0e-7      # deep current bottom damping (1/s)
+    deep_visc: 2.0e+4      # deep current and temperature horizontal diffusion (m^2/s)
+    deep_temp_min_k: 268.0 # numerical lower bound for deep-water temperature
+
+  # ---- 大气垂直分层与层间动力学 ----
+  vertical:
+    enabled: true
+    levels_m: [100, 1000,2000, 3000, 6000, 10000] # 各层中心海拔 (m)，必须严格递增
+    lapse_rate: 0.0065     # 环境温度直减率 (K/m)
+    scale_height: 8000.0   # 气压/层质量指数衰减尺度高度 (m)
+    continuity_relax: 1800.0 # 垂直速度向质量连续诊断值调整的时间 (s)
+    buoyancy_factor: 1.5e-4 # 气柱相对环境直减率异常产生浮力的强度
+    w_damping: 5.0e-4      # 垂直速度阻尼 (1/s)
+    w_max: 1.5             # 垂直速度限幅 (m/s)
+    diff_momentum: 12.0    # 层间动量交换系数 (m^2/s)
+    diff_heat: 8.0         # 层间热交换系数 (m^2/s)
+    diff_moisture: 5.0     # 层间水汽交换系数 (m^2/s)
+
+  # ---- 地形对近地层风的作用 ----
+  topography:
+    enabled: true
+    smooth_passes: 2       # 计算坡度前的 1-2-1 地形平滑次数
+    influence_height: 2500.0 # 地形作用随高度衰减的尺度 (m)
+    elevation_scale: 1500.0 # 海拔阻力达到显著强度的尺度 (m)
+    slope_scale: 0.02      # 坡度阻挡达到显著强度的尺度 (m/m)
+    drag_multiplier: 8.0  # 高地粗糙度相对基础 drag 的增强倍数
+    blocking_rate: 8.0e-4 # 跨山风分量阻挡率 (1/s)
+    deflection_rate: 3.0e-4 # 沿等高线偏转率 (1/s)
+    lift_efficiency: 0.3   # 水平迎坡速度转为垂直速度的比例
+    lift_max: 1.0          # 地形抬升/下沉速度限幅 (m/s)
 
 numerics:
   advection: upwind      # 平流格式 (目前: upwind)
-  cos_clamp: 0.02         # 高纬 cos(lat) 下限(防极点奇异)
-  polar_filter_lat: 88.0 # 该纬度以上启用纬向滤波
+  cos_clamp: 0.2         # 高纬 cos(lat) 下限(防极点奇异)
+  polar_filter_lat: 80.0 # 该纬度以上启用纬向滤波
   polar_filter_passes: 6
 
 # 离线预演算(先算好再回放, 精度可以开高)
@@ -70,6 +153,10 @@ precompute:
 server:
   host: 0.0.0.0
   port: 8000
-  steps_per_frame: 3     # 实时模式下每推送一帧走多少物理步
-  max_fps: 10            # 推送帧率上限
+  steps_per_frame: 20     # 实时模式下每推送一帧走多少物理步
+  max_fps: 60            # 推送帧率上限
   vector_stride: 5       # 风场/洋流矢量抽稀间隔
+  basemap_width: 2160    # 地球基础贴图宽度；首启会重新生成
+  record_enabled: true   # 实时演算默认写入可回放帧
+  record_dir: output/recordings
+  record_every_steps: 600 # 每 N 个物理步保存一帧

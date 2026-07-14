@@ -39,12 +39,34 @@ camera.position.set(0, 0.6, 3.2);
 
 const meta = await (await fetch("/api/meta")).json();
 const [NLAT, NLON] = meta.shape;
+let atmosphereLevels = Array.isArray(meta.atmosphere_levels_m) ? meta.atmosphere_levels_m : [];
+let windLayerAvailable = meta.wind_layer_available !== false;
+let pendingWindLayer = null;
 document.getElementById("badge-mode").textContent = meta.mode === "live" ? "实时模拟" : "预演算回放";
 document.getElementById("badge-backend").textContent = "后端 " + meta.backend.toUpperCase();
+
+function setRecordingState(enabled) {
+  const button = document.getElementById("btn-record");
+  button.classList.toggle("recording", enabled);
+  button.setAttribute("aria-pressed", String(enabled));
+  button.title = enabled ? "\u505c\u6b62\u8bb0\u5f55" : "\u5f00\u59cb\u8bb0\u5f55";
+}
+if (meta.mode === "live") {
+  setRecordingState(meta.recording !== false);
+  document.getElementById("btn-reset").onclick = () => send({ cmd: "reset" });
+  document.getElementById("btn-record").onclick = () => {
+    send({ cmd: "record", enabled: !document.getElementById("btn-record").classList.contains("recording") });
+  };
+} else {
+  document.querySelectorAll(".live-only").forEach(x => x.classList.add("hidden"));
+}
 
 const texLoader = new THREE.TextureLoader();
 const baseTex = await texLoader.loadAsync("/api/basemap.png");
 baseTex.colorSpace = THREE.SRGBColorSpace;
+baseTex.minFilter = THREE.LinearMipmapLinearFilter;
+baseTex.magFilter = THREE.LinearFilter;
+baseTex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
 
 function makeDataTex(w, h) {
   const t = new THREE.DataTexture(new Uint8Array(w * h), w, h, THREE.RedFormat, THREE.UnsignedByteType);
@@ -122,26 +144,23 @@ const globeMat = new THREE.ShaderMaterial({
         if (oceanOnly == 1) m *= 1.0 - step(0.5, texture2D(landTex, uv).r);
         col = mix(col, c.rgb, m);
       }
-      // 云层
+      // Linear opacity preserves a visible difference for every encoded cloud percent.
       float cl = texture2D(cloudTex, uv).r;
-      col = mix(col, vec3(0.97), showCloud * cl * cl * 0.75);
+      float cloudOpacity = cl * 0.92;
+      vec3 cloudColor = mix(vec3(0.64, 0.70, 0.77), vec3(0.985), cl);
+      col = mix(col, cloudColor, showCloud * cloudOpacity);
 
-      // 昼夜
+      // Brighter direct sunlight without an additive surface halo.
       float d = dot(n, sunDir);
-      float day = mix(1.0, smoothstep(-0.12, 0.18, d) * 0.82 + 0.18, showNight);
-      col *= day;
-      // 大气边缘辉光
-      float fres = pow(1.0 - abs(dot(normalize(vView), n)), 3.0);
-      col += vec3(0.25, 0.55, 0.60) * fres * 0.55 * (0.35 + 0.65 * day);
+      float day = smoothstep(-0.16, 0.12, d);
+      float illumination = 0.14 + day * 0.96 + max(d, 0.0) * 0.22;
+      col *= mix(1.0, illumination, showNight);
 
       gl_FragColor = vec4(col, 1.0);
     }`,
 });
-const globe = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 64), globeMat);
+const globe = new THREE.Mesh(new THREE.SphereGeometry(1, 160, 96), globeMat);
 scene.add(globe);
-scene.add(new THREE.Mesh(
-  new THREE.SphereGeometry(1.012, 64, 48),
-  new THREE.MeshBasicMaterial({ color: 0x5eead4, transparent: true, opacity: 0.045, side: THREE.BackSide })));
 
 // ---------------- 矢量叠加(风场/洋流) ----------------
 function makeVecLines(color) {
@@ -156,12 +175,12 @@ const windLines = makeVecLines(0xf5f7fa);
 const oceanLines = makeVecLines(0x53d6ff);
 const flowLines = { wind: windLines, ocean: oceanLines };
 const flowScale = {
-  wind: { vector: 0.0035, maxVector: 0.09, stream: 0.7, steps: 5 },
-  ocean: { vector: 0.05, maxVector: 0.07, stream: 0.9, steps: 5 },
+  wind: { vector: 0.0038, maxVector: 0.095, stream: 0.55, steps: 14 },
+  ocean: { vector: 0.055, maxVector: 0.075, stream: 0.55, steps: 14 },
 };
 const initialStrides = meta.vector_strides || { wind: meta.vector_stride || 5, ocean: meta.vector_stride || 5 };
 const flowState = {
-  wind: { enabled: false, mode: "vector", stride: initialStrides.wind || 5 },
+  wind: { enabled: false, mode: "vector", stride: initialStrides.wind || 5, layer: meta.wind_layer_index || 0 },
   ocean: { enabled: false, mode: "vector", stride: initialStrides.ocean || 5 },
 };
 
@@ -185,10 +204,30 @@ function updateVectors(lines, vec, shape, stride, scale, maxLen) {
       const east = [Math.cos(lo), 0, -Math.sin(lo)];
       const north = [-Math.sin(la) * Math.sin(lo), Math.cos(la), -Math.sin(la) * Math.cos(lo)];
       let L = Math.min(sp * scale, maxLen);
-      pts.push(p[0], p[1], p[2],
-        p[0] + (east[0] * uu + north[0] * vv) / sp * L,
-        p[1] + (east[1] * uu + north[1] * vv) / sp * L,
-        p[2] + (east[2] * uu + north[2] * vv) / sp * L);
+      const dir = [
+        (east[0] * uu + north[0] * vv) / sp,
+        (east[1] * uu + north[1] * vv) / sp,
+        (east[2] * uu + north[2] * vv) / sp,
+      ];
+      const tip = [p[0] + dir[0] * L, p[1] + dir[1] * L, p[2] + dir[2] * L];
+      pts.push(p[0], p[1], p[2], tip[0], tip[1], tip[2]);
+
+      // 箭头头部：让“矢量图”和“流线图”在视觉上明确不同。
+      const normal = lonLatToPos(lat, lon, 1);
+      let side = [
+        normal[1] * dir[2] - normal[2] * dir[1],
+        normal[2] * dir[0] - normal[0] * dir[2],
+        normal[0] * dir[1] - normal[1] * dir[0],
+      ];
+      const sideLen = Math.hypot(side[0], side[1], side[2]) || 1;
+      side = [side[0] / sideLen, side[1] / sideLen, side[2] / sideLen];
+      const headLen = Math.max(L * 0.32, 0.008);
+      const headWid = headLen * 0.52;
+      const base = [tip[0] - dir[0] * headLen, tip[1] - dir[1] * headLen, tip[2] - dir[2] * headLen];
+      pts.push(
+        tip[0], tip[1], tip[2], base[0] + side[0] * headWid, base[1] + side[1] * headWid, base[2] + side[2] * headWid,
+        tip[0], tip[1], tip[2], base[0] - side[0] * headWid, base[1] - side[1] * headWid, base[2] - side[2] * headWid
+      );
     }
   }
   lines.geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pts), 3));
@@ -211,7 +250,7 @@ function updateStreamlines(lines, vec, shape, stride, stepScale, steps) {
   const pts = [];
   const dLat = 180 / NLAT;
   const dLon = 360 / NLON;
-  const seedStep = Math.max(1, Math.round(stride >= 8 ? 1 : 2));
+  const seedStep = stride <= 2 ? 4 : stride <= 4 ? 3 : stride <= 7 ? 2 : 1;
   const stepDeg = Math.max(dLat, dLon) * stride * stepScale;
 
   for (let i = 0; i < nla; i += seedStep) {
@@ -431,11 +470,68 @@ function strideToDensity(stride) {
 function densityToStride(density) {
   return Math.max(2, 12 - parseInt(density || 7));
 }
+function windLayerCount() {
+  return Math.max(atmosphereLevels.length, 1);
+}
+function clampWindLayer(k) {
+  return Math.max(0, Math.min(windLayerCount() - 1, parseInt(k || 0)));
+}
+function formatWindLayerLabel(k) {
+  const z = atmosphereLevels[k];
+  return Number.isFinite(z) ? `${Math.round(z)} m` : `第 ${k + 1} 层`;
+}
+function sameAtmosphereLevels(next) {
+  if (!Array.isArray(next) || next.length !== atmosphereLevels.length) return false;
+  return next.every((z, i) => z === atmosphereLevels[i]);
+}
+function setupWindLayerControl() {
+  const row = document.getElementById("wind-layer-row");
+  const layer = document.getElementById("wind-layer");
+  const count = windLayerCount();
+  layer.innerHTML = "";
+  for (let k = 0; k < count; k++) {
+    const opt = document.createElement("option");
+    opt.value = String(k);
+    opt.textContent = formatWindLayerLabel(k);
+    layer.appendChild(opt);
+  }
+  row.classList.toggle("hidden", count <= 1 || !windLayerAvailable);
+  layer.disabled = !windLayerAvailable;
+  flowState.wind.layer = clampWindLayer(flowState.wind.layer);
+  if (pendingWindLayer !== null) pendingWindLayer = clampWindLayer(pendingWindLayer);
+  layer.value = String(flowState.wind.layer);
+}
+function syncWindLayerMeta(m) {
+  let controlsChanged = false;
+  if (Array.isArray(m.atmosphere_levels_m) && !sameAtmosphereLevels(m.atmosphere_levels_m)) {
+    atmosphereLevels = m.atmosphere_levels_m;
+    controlsChanged = true;
+  }
+  if (typeof m.wind_layer_available === "boolean" && windLayerAvailable !== m.wind_layer_available) {
+    windLayerAvailable = m.wind_layer_available;
+    controlsChanged = true;
+  }
+  if (!windLayerAvailable) pendingWindLayer = null;
+  if (controlsChanged) setupWindLayerControl();
+}
+function syncWindLayerSelection(m) {
+  if (!Number.isInteger(m.wind_layer_index)) return true;
+  const serverLayer = clampWindLayer(m.wind_layer_index);
+  const waitingForSelection = pendingWindLayer !== null;
+  if (waitingForSelection && serverLayer !== pendingWindLayer) return false;
+
+  pendingWindLayer = null;
+  flowState.wind.layer = serverLayer;
+  const layer = document.getElementById("wind-layer");
+  if (layer) layer.value = String(serverLayer);
+  return true;
+}
 function setupFlowControls(name) {
   const tg = document.getElementById("tg-" + name);
   const mode = document.getElementById(name + "-mode");
   const density = document.getElementById(name + "-density");
   const label = document.getElementById(name + "-density-label");
+  const layer = document.getElementById(name + "-layer");
   const state = flowState[name];
 
   density.value = strideToDensity(state.stride);
@@ -451,6 +547,15 @@ function setupFlowControls(name) {
     state.mode = e.target.value;
     updateFlow(name, lastFrame);
   };
+  if (layer) {
+    layer.onchange = e => {
+      state.layer = clampWindLayer(e.target.value);
+      pendingWindLayer = state.layer;
+      layer.value = String(state.layer);
+      clearLines(flowLines.wind);
+      send({ cmd: "set_wind_layer", value: state.layer });
+    };
+  }
   density.oninput = () => {
     state.stride = densityToStride(density.value);
     updateDensityLabel();
@@ -461,7 +566,9 @@ function syncFlowSettings() {
   for (const [name, state] of Object.entries(flowState)) {
     send({ cmd: "set_vector_stride", target: name, value: state.stride });
   }
+  send({ cmd: "set_wind_layer", value: flowState.wind.layer });
 }
+setupWindLayerControl();
 setupFlowControls("wind");
 setupFlowControls("ocean");
 
@@ -503,18 +610,20 @@ ws.onmessage = ev => {
   for (const L of m.layers) m.bytes[L.name] = new Uint8Array(ev.data.slice(base + L.off, base + L.off + L.len));
   m.vecf = {};
   for (const V of m.vecs) m.vecf[V.name] = { data: new Float32Array(ev.data.slice(base + V.off, base + V.off + V.len)), shape: V.shape, stride: V.stride };
+  syncWindLayerMeta(m);
+  const windLayerMatchesSelection = syncWindLayerSelection(m);
   lastFrame = m;
-  render(m);
+  render(m, windLayerMatchesSelection);
 };
 
-function render(m) {
+function render(m, windLayerMatchesSelection = true) {
   cloudTex.image.data.set(m.bytes.cloud); cloudTex.needsUpdate = true;
   iceTex.image.data.set(m.bytes.ice); iceTex.needsUpdate = true;
   if (LAYERS[activeLayer].cm) {
     dataTex.image.data.set(m.bytes[activeLayer]); dataTex.needsUpdate = true;
     drawLegend(LAYERS[activeLayer], m.layers.find(l => l.name === activeLayer));
   }
-  updateFlow("wind", m);
+  if (windLayerMatchesSelection) updateFlow("wind", m);
   updateFlow("ocean", m);
   refreshSelectedAnalysis();
   // 太阳方向
@@ -525,6 +634,7 @@ function render(m) {
   document.getElementById("sim-clock").textContent = m.time.replace("T", "  ").slice(0, 17) + " UTC";
   document.getElementById("btn-play").textContent = m.playing ? "⏸" : "▶";
   playing = m.playing;
+  if (m.mode === "live" && typeof m.recording === "boolean") setRecordingState(m.recording);
   if (m.mode === "playback") {
     document.querySelectorAll(".pb-only").forEach(x => x.classList.remove("hidden"));
     const tl = document.getElementById("timeline");

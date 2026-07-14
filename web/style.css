@@ -79,6 +79,15 @@ body {
   font-size: 11px;
   color: var(--dim);
 }
+.flow-layer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.flow-layer select { flex: 1; min-width: 0; }
 .flow-density input[type=range] { flex: 1; min-width: 0; accent-color: var(--teal); }
 .flow-density .mono { min-width: 14px; text-align: right; color: var(--amber); }
 #legend { margin-top: 14px; }
@@ -116,6 +125,7 @@ body {
   color: var(--teal); font-size: 15px; width: 38px; height: 32px; cursor: pointer;
 }
 #transport button:hover { background: rgba(94, 234, 212, 0.10); }
+#transport #btn-record.recording { color: #ff6b6b; border-color: rgba(255, 107, 107, 0.55); }
 .speed { display: flex; align-items: center; gap: 8px; }
 #speed { width: 110px; accent-color: var(--teal); }
 #speed-label { color: var(--amber); font-size: 12px; width: 40px; }

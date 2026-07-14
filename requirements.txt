@@ -1,8 +1,12 @@
+uv
+uvicorn
 numpy>=1.24
 pyyaml>=6.0
 fastapi>=0.110
 uvicorn[standard]>=0.27
 pillow>=10.0
+xarray>=2024.1
+netCDF4>=1.6
 # GPU 加速(可选, 按 CUDA 版本二选一):
-# cupy-cuda12x
+cupy-cuda13x
 # cupy-cuda11x
