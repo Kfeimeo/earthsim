@@ -50,7 +50,10 @@ def analyze_point(fields, lats, lons, land, lat, lon):
         "wind_dir": round(wdir),
         "ice": round(g("ice") * 100),
     }
-    if not is_land:
+    if is_land:
+        if "ground_water" in fields:
+            out["ground_water"] = round(g("ground_water"), 1)
+    else:
         out["sst"] = round(g("sst"), 1)
         out["current"] = round(float(np.hypot(g("uo"), g("vo"))), 2)
     return out

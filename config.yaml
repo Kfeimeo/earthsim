@@ -15,7 +15,7 @@ grid:
     - data/etopo20.npz
 
 time:
-  dt: 30
+  dt: 60
   start: "2026-05-01T00:00:00"
   spinup_days: 0
 
@@ -81,7 +81,12 @@ physics:
   init_upper_rh: 0.28    # 理想初始场高层相对湿度
   ideal_wave_amp_K: 1.2  # 理想初始场温度扰动, 打破经向均匀
   ideal_humidity_wave: 0.10 # 理想初始场湿度扰动比例
-  land_evap: 0.05        # 陆面蒸发相对海面的比例
+  land_evap: 0.05        # 完全湿润陆面的蒸发相对海面的比例
+  ground_water_capacity_mm: 150.0 # 地面储水上限（等效水深 mm）
+  initial_ground_water_mm: 60.0 # 理想初始场陆地储水（mm）
+  ground_evap_exponent: 1.0 # 湿润度对陆面蒸发的幂指数
+  ground_runoff_tau: 864000.0 # 地面满水时的河流外排时间尺度（s，10 天）
+  ground_runoff_exponent: 2.0 # 外排幂指数；必须 >1，越大则湿地流失加速越明显
 
     # ---- 初始风场 ----
   ideal_wind_enabled: true # ideal 初始化时启用先验风场
@@ -120,7 +125,7 @@ physics:
     continuity_relax: 1800.0 # 垂直速度向质量连续诊断值调整的时间 (s)
     buoyancy_factor: 1.5e-4 # 气柱相对环境直减率异常产生浮力的强度
     w_damping: 5.0e-4      # 垂直速度阻尼 (1/s)
-    w_max: 1.5             # 垂直速度限幅 (m/s)
+    w_max: 20             # 垂直速度限幅 (m/s)
     diff_momentum: 12.0    # 层间动量交换系数 (m^2/s)
     diff_heat: 8.0         # 层间热交换系数 (m^2/s)
     diff_moisture: 5.0     # 层间水汽交换系数 (m^2/s)
@@ -136,12 +141,12 @@ physics:
     blocking_rate: 8.0e-4 # 跨山风分量阻挡率 (1/s)
     deflection_rate: 3.0e-4 # 沿等高线偏转率 (1/s)
     lift_efficiency: 0.3   # 水平迎坡速度转为垂直速度的比例
-    lift_max: 1.0          # 地形抬升/下沉速度限幅 (m/s)
+    lift_max: 10          # 地形抬升/下沉速度限幅 (m/s)
 
 numerics:
   advection: upwind      # 平流格式 (目前: upwind)
-  cos_clamp: 0.2         # 高纬 cos(lat) 下限(防极点奇异)
-  polar_filter_lat: 80.0 # 该纬度以上启用纬向滤波
+  cos_clamp: 0.1         # 高纬 cos(lat) 下限(防极点奇异)
+  polar_filter_lat: 88.0 # 该纬度以上启用纬向滤波
   polar_filter_passes: 6
 
 # 离线预演算(先算好再回放, 精度可以开高)
@@ -153,7 +158,7 @@ precompute:
 server:
   host: 0.0.0.0
   port: 8000
-  steps_per_frame: 20     # 实时模式下每推送一帧走多少物理步
+  steps_per_frame: 2     # 实时模式下每推送一帧走多少物理步
   max_fps: 60            # 推送帧率上限
   vector_stride: 5       # 风场/洋流矢量抽稀间隔
   basemap_width: 2160    # 地球基础贴图宽度；首启会重新生成

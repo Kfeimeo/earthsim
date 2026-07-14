@@ -5,8 +5,8 @@
 // ============================================================
 extern "C" {
 
-#define ADV_BLOCK_X 16
-#define ADV_BLOCK_Y 16
+#define ADV_BLOCK_X 32
+#define ADV_BLOCK_Y 32
 
 __device__ __forceinline__ int wrap(int j, int n) {
     return (j + n) % n;
