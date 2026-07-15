@@ -62,7 +62,7 @@ class EarthModel:
         self.level_edges_m = edges
         self.layer_dz_m = _np.diff(edges).astype(_np.float32)
 
-        scale_h = max(float(vp.scale_height), 1000.0)
+        scale_h = max(float(vp.scale_height), float(vp.scale_height_min_m))
         mass = _np.exp(-edges[:-1] / scale_h) - _np.exp(-edges[1:] / scale_h)
         mass /= mass.sum()
         self.layer_mass_fractions = mass.astype(_np.float32)
@@ -74,11 +74,13 @@ class EarthModel:
         """Pre-compute a smoothed terrain gradient used by the wind scheme."""
         xp, o, tp = self.xp, self.ops, self.cfg.physics.topography
         terrain = xp.maximum(self.elev, 0.0) * self.land
+        center = float(tp.smooth_center_weight)
+        neighbor = float(tp.smooth_neighbor_weight)
         for _ in range(max(0, int(tp.smooth_passes))):
-            terrain = (0.25 * o.rollx(terrain, 1) + 0.5 * terrain
-                       + 0.25 * o.rollx(terrain, -1))
-            terrain = (0.25 * o.shifty(terrain, 1) + 0.5 * terrain
-                       + 0.25 * o.shifty(terrain, -1))
+            terrain = (neighbor * o.rollx(terrain, 1) + center * terrain
+                       + neighbor * o.rollx(terrain, -1))
+            terrain = (neighbor * o.shifty(terrain, 1) + center * terrain
+                       + neighbor * o.shifty(terrain, -1))
         self.terrain_slope_x = o.ddx(terrain).astype(xp.float32)
         self.terrain_slope_y = o.ddy(terrain).astype(xp.float32)
         self.terrain_slope = xp.sqrt(self.terrain_slope_x ** 2
@@ -87,32 +89,44 @@ class EarthModel:
     # ------------------------------------------------------------
     def _init_state(self):
         xp, p = self.xp, self.cfg.physics
+        ic, bounds = p.initial_conditions, p.bounds
         lat = self.ops.lat
         f32 = xp.float32
-        Teq = (308.0 - 42.0 * xp.sin(lat) ** 2) * xp.ones((1, self.nlon))
+        Teq = (float(ic.equilibrium_temp_base_k)
+               - float(ic.equilibrium_temp_pole_delta_k)
+               * xp.sin(lat) ** 2) * xp.ones((1, self.nlon))
         lapse = float(p.vertical.lapse_rate)
         self.T_layers = xp.stack(
             [Teq - lapse * z for z in self.levels_m], axis=0).astype(f32)
         # 海表: 不低于 -2C; 陆面随高度递减
-        self.Ts = (Teq - 0.0065 * xp.maximum(self.elev, 0) * self.land)
-        self.Ts = xp.where((self.ocean > 0.5) & (self.Ts < 271.2),
-                           271.2, self.Ts).astype(f32)
-        init_surface_rh = float(getattr(p, "init_surface_rh", 0.58))
-        init_upper_rh = float(getattr(p, "init_upper_rh", 0.28))
+        self.Ts = (Teq - float(ic.surface_lapse_rate)
+                   * xp.maximum(self.elev, 0) * self.land)
+        self.Ts = xp.where(
+            (self.ocean > 0.5)
+            & (self.Ts < float(bounds.ocean_initial_min_temp_k)),
+            float(bounds.ocean_initial_min_temp_k), self.Ts).astype(f32)
+        init_surface_rh = float(p.init_surface_rh)
+        init_upper_rh = float(p.init_upper_rh)
         rh_profile = (init_upper_rh + (init_surface_rh - init_upper_rh)
-                      * _np.exp(-self.levels_m / 4500.0))
+                      * _np.exp(-self.levels_m
+                                / float(ic.humidity_decay_height_m)))
         self.q_layers = (xp.asarray(rh_profile, dtype=f32)[:, None, None]
                          * qsat(xp, self.T_layers)).astype(f32)
-        wave_amp = float(getattr(p, "ideal_wave_amp_K", 1.2))
+        wave_amp = float(p.ideal_wave_amp_K)
         if wave_amp:
             lon = xp.asarray(_np.radians(self.lons), dtype=f32)[None, :]
-            wave = ((xp.sin(3.0 * lon + 0.7 * xp.sin(lat))
-                     + 0.5 * xp.sin(5.0 * lon - 1.3 * xp.sin(lat)))
+            wave = ((xp.sin(float(ic.temp_wave_lon1) * lon
+                             + float(ic.temp_wave_phase1) * xp.sin(lat))
+                     + float(ic.temp_wave_weight2)
+                     * xp.sin(float(ic.temp_wave_lon2) * lon
+                              + float(ic.temp_wave_phase2) * xp.sin(lat)))
                     * xp.cos(lat) ** 2)
-            decay = xp.exp(-self._z3 / 7000.0)
+            decay = xp.exp(-self._z3 / float(ic.temp_wave_decay_height_m))
             self.T_layers = (self.T_layers + wave_amp * decay * wave).astype(f32)
-            q_wave = 1.0 + float(getattr(p, "ideal_humidity_wave", 0.10)) * wave
-            self.q_layers = xp.clip(self.q_layers * q_wave, 0, 0.05).astype(f32)
+            q_wave = 1.0 + float(p.ideal_humidity_wave) * wave
+            self.q_layers = xp.clip(
+                self.q_layers * q_wave, float(bounds.humidity_min),
+                float(bounds.humidity_max)).astype(f32)
         layer_mean = self.T_layers.mean(axis=(1, 2), keepdims=True)
         self.h_layers = (p.H0 - p.beta_T *
                          (self.T_layers - layer_mean)).astype(f32)
@@ -122,17 +136,17 @@ class EarthModel:
         z = xp.zeros((self.nlat, self.nlon), f32)
         self.uo, self.vo = z.copy(), z.copy()
         self.cloud, self.precip = z.copy(), z.copy()
-        capacity = float(getattr(p, "ground_water_capacity_mm", 150.0))
-        initial_water = float(getattr(p, "initial_ground_water_mm", 60.0))
+        capacity = float(p.ground_water_capacity_mm)
+        initial_water = float(p.initial_ground_water_mm)
         if capacity <= 0:
             raise ValueError("physics.ground_water_capacity_mm must be positive")
         if initial_water < 0:
             raise ValueError("physics.initial_ground_water_mm must be non-negative")
-        if float(getattr(p, "ground_evap_exponent", 1.0)) < 0:
+        if float(p.ground_evap_exponent) < 0:
             raise ValueError("physics.ground_evap_exponent must be non-negative")
-        if float(getattr(p, "ground_runoff_tau", 864000.0)) <= 0:
+        if float(p.ground_runoff_tau) <= 0:
             raise ValueError("physics.ground_runoff_tau must be positive")
-        if float(getattr(p, "ground_runoff_exponent", 2.0)) <= 1:
+        if float(p.ground_runoff_exponent) <= 1:
             raise ValueError("physics.ground_runoff_exponent must be greater than 1")
         self.ground_water = (self.land * min(initial_water, capacity)).astype(f32)
         self.runoff = z.copy()
@@ -161,6 +175,7 @@ class EarthModel:
             raise
 
         xp, p = self.xp, self.cfg.physics
+        ic, bounds, pressure = p.initial_conditions, p.bounds, p.pressure
 
         def finite(value, fallback):
             if value is None:
@@ -173,25 +188,33 @@ class EarthModel:
                                   else fallback_value, posinf=fallback_value,
                                   neginf=fallback_value)
 
-        temp = finite(real["temp"], 280.0)
-        q = finite(real["q"], 0.01)
+        temp = finite(real["temp"], float(ic.real_default_temp_k))
+        q = finite(real["q"], float(ic.real_default_humidity))
         u = finite(real["u"], 0.0)
         v = finite(real["v"], 0.0)
         if temp.shape != (self.nz, self.nlat, self.nlon):
             raise RealDataError(f"real temperature shape {temp.shape} does not match model")
-        self.T_layers = xp.asarray(_np.clip(temp, 160, 345), dtype=xp.float32)
-        self.q_layers = xp.asarray(_np.clip(q, 0, 0.05), dtype=xp.float32)
+        self.T_layers = xp.asarray(
+            _np.clip(temp, float(bounds.air_temp_min_k),
+                     float(bounds.air_temp_max_k)), dtype=xp.float32)
+        self.q_layers = xp.asarray(
+            _np.clip(q, float(bounds.humidity_min),
+                     float(bounds.humidity_max)), dtype=xp.float32)
         self.u_layers = xp.asarray(_np.clip(u, -p.umax, p.umax), dtype=xp.float32)
         self.v_layers = xp.asarray(_np.clip(v, -p.umax, p.umax), dtype=xp.float32)
         self.w_layers = xp.zeros_like(self.T_layers)
 
-        mslp = finite(real.get("mslp_hpa"), 1013.0)
-        h_base = float(p.H0) + (mslp - 1013.0) / 0.045
+        mslp = finite(real.get("mslp_hpa"), float(ic.real_default_mslp_hpa))
+        h_base = (float(p.H0)
+                  + (mslp - float(pressure.mslp_reference_hpa))
+                  * float(pressure.thickness_per_hpa))
         tmean = self.T_layers.mean(axis=(1, 2), keepdims=True)
         h = h_base[None, :, :] - float(p.beta_T) * (
             temp - _np.asarray(to_cpu(tmean)))
         self.h_layers = xp.asarray(_np.clip(
-            h, 0.4 * float(p.H0), 1.8 * float(p.H0)), dtype=xp.float32)
+            h, float(pressure.thickness_min_factor) * float(p.H0),
+            float(pressure.thickness_max_factor) * float(p.H0)),
+            dtype=xp.float32)
 
         surface = finite(real.get("surface"), temp[0])
         ocean_surface = real.get("ocean_surface")
@@ -199,20 +222,27 @@ class EarthModel:
             ocean_surface = finite(ocean_surface, surface)
             surface = _np.where(_np.asarray(to_cpu(self.ocean)) > 0.5,
                                 ocean_surface, surface)
-        self.Ts = xp.asarray(_np.clip(surface, 170, 350), dtype=xp.float32)
+        self.Ts = xp.asarray(
+            _np.clip(surface, float(bounds.surface_temp_min_k),
+                     float(bounds.surface_temp_max_k)), dtype=xp.float32)
 
         self.uo = xp.asarray(_np.clip(
-            finite(real.get("ou"), 0.0), -2, 2), dtype=xp.float32) * self.ocean
+            finite(real.get("ou"), 0.0), -float(bounds.ocean_current_max_ms),
+            float(bounds.ocean_current_max_ms)), dtype=xp.float32) * self.ocean
         self.vo = xp.asarray(_np.clip(
-            finite(real.get("ov"), 0.0), -2, 2), dtype=xp.float32) * self.ocean
+            finite(real.get("ov"), 0.0), -float(bounds.ocean_current_max_ms),
+            float(bounds.ocean_current_max_ms)), dtype=xp.float32) * self.ocean
         self.cloud = xp.asarray(_np.clip(
-            finite(real.get("cloud"), 0.0), 0, 1), dtype=xp.float32)
+            finite(real.get("cloud"), 0.0), float(bounds.cloud_min),
+            float(bounds.cloud_max)), dtype=xp.float32)
         self.precip = xp.asarray(_np.clip(
-            finite(real.get("precip"), 0.0), 0, 1.2), dtype=xp.float32)
+            finite(real.get("precip"), 0.0), 0,
+            float(bounds.precip_max_mmh)), dtype=xp.float32)
         sea_ice = real.get("sea_ice")
         if sea_ice is not None:
             self.ice = xp.asarray(_np.clip(
-                finite(sea_ice, 0.0), 0, 1), dtype=xp.float32) * self.ocean
+                finite(sea_ice, 0.0), float(bounds.cloud_min),
+                float(bounds.cloud_max)), dtype=xp.float32) * self.ocean
         self.initialization_source = "real"
         self._sync_surface_views()
         self._diag_surface()
@@ -256,24 +286,31 @@ class EarthModel:
     def _advance_ocean(self, Ts, air_u, air_v):
         """Advance wind-driven surface flow and the optional coupled deep layer."""
         xp, p, o, dt = self.xp, self.cfg.physics, self.ops, self.dt
+        bounds, ot = p.bounds, p.ocean_transport
         if not p.ocean:
             return Ts
 
         uo, vo = self.uo, self.vo
-        spd = xp.sqrt(air_u * air_u + air_v * air_v) + 1.0
+        spd = (xp.sqrt(air_u * air_u + air_v * air_v)
+               + float(ot.wind_speed_floor_ms))
         uo = (uo + dt * (p.tau_ocean * spd * air_u - p.drag_ocean * uo)
               + dt * p.visc_ocean * o.lap(uo))
         vo = (vo + dt * (p.tau_ocean * spd * air_v - p.drag_ocean * vo)
               + dt * p.visc_ocean * o.lap(vo))
-        uo, vo = o.coriolis_rotate(uo, vo, dt * 0.15)
+        uo, vo = o.coriolis_rotate(
+            uo, vo, dt * float(ot.ekman_coriolis_factor))
 
         open_ocean = self.ocean * (1 - self.ice)
         if not self.ocean_layers_enabled:
-            self.uo = (xp.clip(uo, -2, 2) * open_ocean).astype(xp.float32)
-            self.vo = (xp.clip(vo, -2, 2) * open_ocean).astype(xp.float32)
+            max_current = float(bounds.ocean_current_max_ms)
+            self.uo = (xp.clip(uo, -max_current, max_current)
+                       * open_ocean).astype(xp.float32)
+            self.vo = (xp.clip(vo, -max_current, max_current)
+                       * open_ocean).astype(xp.float32)
             return xp.where(
                 self.ocean > 0.5,
-                o.adv_diff_step(Ts, self.uo, self.vo, 2e3, dt),
+                o.adv_diff_step(Ts, self.uo, self.vo,
+                                float(ot.surface_heat_diffusivity), dt),
                 Ts,
             )
 
@@ -283,7 +320,8 @@ class EarthModel:
                + dt * float(layers.deep_visc) * o.lap(uod))
         vod = (vod - dt * float(layers.deep_drag) * vod
                + dt * float(layers.deep_visc) * o.lap(vod))
-        uod, vod = o.coriolis_rotate(uod, vod, dt * 0.15)
+        uod, vod = o.coriolis_rotate(
+            uod, vod, dt * float(ot.ekman_coriolis_factor))
 
         depth_ratio = self.ocean_upper_depth_m / self.ocean_lower_depth_m
         momentum_exchange = dt * float(layers.interlayer_drag)
@@ -292,12 +330,18 @@ class EarthModel:
         vo += dv
         uod -= depth_ratio * du
         vod -= depth_ratio * dv
-        self.uo = (xp.clip(uo, -2, 2) * open_ocean).astype(xp.float32)
-        self.vo = (xp.clip(vo, -2, 2) * open_ocean).astype(xp.float32)
-        self.uo_deep = (xp.clip(uod, -2, 2) * open_ocean).astype(xp.float32)
-        self.vo_deep = (xp.clip(vod, -2, 2) * open_ocean).astype(xp.float32)
+        max_current = float(bounds.ocean_current_max_ms)
+        self.uo = (xp.clip(uo, -max_current, max_current)
+                   * open_ocean).astype(xp.float32)
+        self.vo = (xp.clip(vo, -max_current, max_current)
+                   * open_ocean).astype(xp.float32)
+        self.uo_deep = (xp.clip(uod, -max_current, max_current)
+                        * open_ocean).astype(xp.float32)
+        self.vo_deep = (xp.clip(vod, -max_current, max_current)
+                        * open_ocean).astype(xp.float32)
 
-        surface = o.adv_diff_step(Ts, self.uo, self.vo, 2e3, dt)
+        surface = o.adv_diff_step(Ts, self.uo, self.vo,
+                                  float(ot.surface_heat_diffusivity), dt)
         deep = o.adv_diff_step(
             self.To_deep, self.uo_deep, self.vo_deep,
             float(layers.deep_visc), dt,
@@ -316,40 +360,54 @@ class EarthModel:
     def _initial_wind_layers(self, shape3, dtype):
         """Return an idealized balanced-ish zonal wind with wave seeds."""
         xp, p = self.xp, self.cfg.physics
-        if not bool(getattr(p, "ideal_wind_enabled", True)):
+        ws = p.ideal_wind_shape
+        if not bool(p.ideal_wind_enabled):
             return xp.zeros(shape3, dtype), xp.zeros(shape3, dtype)
 
         lat = self.ops.lat
         lat_deg = xp.abs(lat * (180.0 / _np.pi))
         z = self._z3
-        trade = float(getattr(p, "ideal_trade_wind_ms", 5.0))
-        surface_westerly = float(getattr(p, "ideal_surface_westerly_ms", 4.0))
-        jet = float(getattr(p, "ideal_jet_ms", 22.0))
-        polar = float(getattr(p, "ideal_polar_easterly_ms", 2.5))
-        jet_lat = float(getattr(p, "ideal_jet_lat_deg", 42.0))
-        jet_width = max(float(getattr(p, "ideal_jet_width_deg", 12.0)), 1.0)
-        jet_height = float(getattr(p, "ideal_jet_height_m", 9000.0))
-        jet_depth = max(float(getattr(p, "ideal_jet_depth_m", 4500.0)), 1.0)
+        trade = float(p.ideal_trade_wind_ms)
+        surface_westerly = float(p.ideal_surface_westerly_ms)
+        jet = float(p.ideal_jet_ms)
+        polar = float(p.ideal_polar_easterly_ms)
+        jet_lat = float(p.ideal_jet_lat_deg)
+        jet_width = max(float(p.ideal_jet_width_deg), 1.0)
+        jet_height = float(p.ideal_jet_height_m)
+        jet_depth = max(float(p.ideal_jet_depth_m), 1.0)
 
-        trades = -trade * xp.exp(-(lat_deg / 23.0) ** 2) * xp.exp(-z / 3500.0)
+        trades = (-trade
+                  * xp.exp(-(lat_deg / float(ws.trade_lat_width_deg)) ** 2)
+                  * xp.exp(-z / float(ws.trade_decay_height_m)))
         low_westerlies = (surface_westerly
-                          * xp.exp(-((lat_deg - 48.0) / 18.0) ** 2)
-                          * xp.exp(-z / 4500.0))
+                          * xp.exp(-((lat_deg
+                                       - float(ws.surface_westerly_lat_deg))
+                                      / float(ws.surface_westerly_width_deg))
+                                     ** 2)
+                          * xp.exp(-z
+                                   / float(ws.surface_westerly_decay_height_m)))
         upper_jets = (jet * xp.exp(-((lat_deg - jet_lat) / jet_width) ** 2)
                       * xp.exp(-((z - jet_height) / jet_depth) ** 2))
-        polar_easterlies = (-polar * xp.exp(-((lat_deg - 72.0) / 11.0) ** 2)
-                            * xp.exp(-z / 5500.0))
+        polar_easterlies = (-polar
+                            * xp.exp(-((lat_deg
+                                         - float(ws.polar_easterly_lat_deg))
+                                        / float(ws.polar_easterly_width_deg))
+                                       ** 2)
+                            * xp.exp(-z
+                                     / float(ws.polar_easterly_decay_height_m)))
         u = (trades + low_westerlies + upper_jets + polar_easterlies
              + xp.zeros(shape3, dtype))
 
-        wave_amp = float(getattr(p, "ideal_wind_wave_ms", 1.2))
+        wave_amp = float(p.ideal_wind_wave_ms)
         if wave_amp:
             lon = xp.asarray(_np.radians(self.lons), dtype=dtype)[None, :]
-            wave_z = xp.exp(-z / 9000.0)
-            u = (u + 0.6 * wave_amp * wave_z
-                 * xp.sin(4.0 * lon + 0.8 * xp.sin(lat)) * xp.cos(lat) ** 2)
+            wave_z = xp.exp(-z / float(ws.wave_decay_height_m))
+            phase = (float(ws.wave_wavenumber) * lon
+                     + float(ws.wave_phase) * xp.sin(lat))
+            u = (u + float(ws.wave_u_fraction) * wave_amp * wave_z
+                 * xp.sin(phase) * xp.cos(lat) ** 2)
             v = (wave_amp * wave_z
-                 * xp.cos(4.0 * lon + 0.8 * xp.sin(lat)) * xp.cos(lat) ** 2)
+                 * xp.cos(phase) * xp.cos(lat) ** 2)
         else:
             v = xp.zeros_like(u)
         return u.astype(dtype), v.astype(dtype)
@@ -416,7 +474,7 @@ class EarthModel:
                      * (self._z3 - float(self.levels_m[0])))
         anomaly = T - reference
         buoyancy = (p.g_eff * float(vp.buoyancy_factor) * anomaly
-                    / xp.maximum(T, 180.0))
+                    / xp.maximum(T, float(vp.buoyancy_temp_min_k)))
         # Heating should redistribute air within a column, not accelerate its centre of mass.
         buoyancy -= (buoyancy * self._mass3).sum(axis=0, keepdims=True)
         relax = max(float(vp.continuity_relax), dt)
@@ -427,8 +485,8 @@ class EarthModel:
     def _surface_atmospheric_drag(self):
         """Return the configured atmospheric drag for each surface type."""
         p = self.cfg.physics
-        ocean_drag = float(getattr(p, "drag_ocean_atmosphere", p.drag))
-        land_drag = float(getattr(p, "drag_land_atmosphere", p.drag))
+        ocean_drag = float(p.drag_ocean_atmosphere)
+        land_drag = float(p.drag_land_atmosphere)
         return self.ocean * ocean_drag + self.land * land_drag
 
     def _surface_evaporation(self, surface_temp, air_humidity, wind_speed):
@@ -438,9 +496,9 @@ class EarthModel:
         capped directly by the water available during this time step.
         """
         xp, p = self.xp, self.cfg.physics
-        capacity = float(getattr(p, "ground_water_capacity_mm", 150.0))
+        capacity = float(p.ground_water_capacity_mm)
         wetness = xp.clip(self.ground_water / capacity, 0, 1)
-        wetness **= float(getattr(p, "ground_evap_exponent", 1.0))
+        wetness **= float(p.ground_evap_exponent)
         potential = (float(p.c_evap) * RHO_A * wind_speed
                      * xp.maximum(qsat(xp, surface_temp) - air_humidity, 0))
         ocean_evap = potential * self.ocean
@@ -451,7 +509,7 @@ class EarthModel:
     def _update_ground_water(self, land_evap, precipitation_mm):
         """Apply rain, evaporation and nonlinear river drainage on land."""
         xp, p, dt = self.xp, self.cfg.physics, self.dt
-        capacity = float(getattr(p, "ground_water_capacity_mm", 150.0))
+        capacity = float(p.ground_water_capacity_mm)
         water = xp.maximum(
             self.ground_water
             + self.land * precipitation_mm
@@ -463,8 +521,8 @@ class EarthModel:
         # limit, exponent > 1 makes the relative loss rate grow with storage.
         overflow = xp.maximum(water - capacity, 0) * self.land
         water = xp.minimum(water, capacity) * self.land
-        tau = float(getattr(p, "ground_runoff_tau", 864000.0))
-        exponent = float(getattr(p, "ground_runoff_exponent", 2.0))
+        tau = float(p.ground_runoff_tau)
+        exponent = float(p.ground_runoff_exponent)
         river_loss = (dt * capacity / tau
                       * xp.clip(water / capacity, 0, 1) ** exponent)
         river_loss = xp.minimum(river_loss, water) * self.land
@@ -474,52 +532,64 @@ class EarthModel:
     def _update_cloud_cover(self, diagnostic_cloud, rh, div):
         """Relax cloud cover toward diagnostics and clear unsupported cloud."""
         xp, p, dt = self.xp, self.cfg.physics, self.dt
+        mt = p.moisture_transport
+        precip_cloud_scale = float(mt.precip_cloud_diagnostic_scale_mmh)
         if getattr(diagnostic_cloud, "ndim", 2) == 3:
             diagnostic = xp.maximum(xp.max(diagnostic_cloud, axis=0),
-                                    xp.clip(self.precip / 2.0, 0, 1))
+                                    xp.clip(self.precip / precip_cloud_scale,
+                                            0, 1))
             rh_ref = xp.max(rh, axis=0)
             div_ref = xp.max(div, axis=0)
         else:
             diagnostic = xp.maximum(diagnostic_cloud,
-                                    xp.clip(self.precip / 2.0, 0, 1))
+                                    xp.clip(self.precip / precip_cloud_scale,
+                                            0, 1))
             rh_ref = rh
             div_ref = div
 
-        tau_form = max(float(getattr(p, "tau_cloud_form", 900.0)), dt)
+        tau_form = max(float(p.tau_cloud_form), dt)
         form = 1.0 - _np.exp(-dt / tau_form)
         cloud = self.cloud + form * (diagnostic - self.cloud)
 
-        tau_dissip = max(float(getattr(p, "tau_cloud_dissip", 5400.0)), dt)
-        clear_rh = float(getattr(p, "cloud_clear_rh", 0.65))
+        tau_dissip = max(float(p.tau_cloud_dissip), dt)
+        clear_rh = float(p.cloud_clear_rh)
         dry = xp.clip((clear_rh - rh_ref) / max(clear_rh, 1e-3), 0, 1)
-        subsidence = xp.clip(1.5e5 * xp.maximum(div_ref, 0), 0, 2)
-        precip_scale = max(float(getattr(p, "cloud_precip_scale", 1.0)), 1e-3)
+        subsidence = xp.clip(
+            float(mt.cloud_subsidence_scale) * xp.maximum(div_ref, 0),
+            0, float(mt.cloud_subsidence_clear_max))
+        precip_scale = max(float(p.cloud_precip_scale), 1e-3)
         rainout = xp.clip(self.precip / precip_scale, 0, 2)
         clear_multiplier = (
             1.0
-            + float(getattr(p, "cloud_dry_clear", 3.0)) * dry
-            + float(getattr(p, "cloud_subsidence_clear", 2.0)) * subsidence
-            + float(getattr(p, "cloud_precip_clear", 0.6)) * rainout
+            + float(p.cloud_dry_clear) * dry
+            + float(p.cloud_subsidence_clear) * subsidence
+            + float(p.cloud_precip_clear) * rainout
         )
         cloud *= xp.exp(-dt * clear_multiplier / tau_dissip)
-        return xp.clip(cloud, 0, 1).astype(xp.float32)
+        return xp.clip(cloud, float(p.bounds.cloud_min),
+                       float(p.bounds.cloud_max)).astype(xp.float32)
 
     def _diagnostic_cloud(self, rh, div):
         """Diagnose cloud fraction from humidity, then suppress subsidence."""
         xp, p = self.xp, self.cfg.physics
-        rh_start = float(getattr(p, "cloud_rh_start", 0.70))
-        rh_full = max(float(getattr(p, "cloud_rh_full", 0.95)), rh_start + 1e-3)
-        exponent = float(getattr(p, "cloud_rh_exponent", 1.6))
+        rh_start = float(p.cloud_rh_start)
+        rh_full = max(float(p.cloud_rh_full), rh_start + 1e-3)
+        exponent = float(p.cloud_rh_exponent)
         cloud = xp.clip((rh - rh_start) / (rh_full - rh_start), 0, 1) ** exponent
-        return cloud * (1 - xp.clip(1.5e5 * div, 0, 0.45))
+        mt = p.moisture_transport
+        return cloud * (1 - xp.clip(float(mt.cloud_subsidence_scale) * div,
+                                    0, float(mt.cloud_subsidence_cover_max)))
 
     def _effective_condensation_rh(self, div):
         """Lower the condensation threshold only in sufficiently convergent flow."""
         xp, p = self.xp, self.cfg.physics
-        conv_scale = max(float(getattr(p, "convective_div_scale", 3.0e-5)), 1e-8)
+        conv_scale = max(float(p.convective_div_scale), 1e-8)
         conv = xp.clip(xp.maximum(-div, 0) / conv_scale, 0, 1)
-        drop = float(getattr(p, "convective_rh_drop_max", 0.12))
-        return xp.clip(float(p.rh_crit) - drop * conv, 0.0, 1.2)
+        drop = float(p.convective_rh_drop_max)
+        mt = p.moisture_transport
+        return xp.clip(float(p.rh_crit) - drop * conv,
+                       float(mt.relative_humidity_min),
+                       float(mt.effective_rh_max))
 
     def _terrain_acceleration(self, u, v, k):
         """Return roughness drag, mountain blocking and contour deflection."""
@@ -537,13 +607,14 @@ class EarthModel:
         block = influence * slope_factor
         rough_drag = surface_drag * (1.0 + float(tp.drag_multiplier) * influence)
 
-        norm = xp.maximum(self.terrain_slope, 1e-6)
+        norm = xp.maximum(self.terrain_slope, float(tp.slope_min))
         nx, ny = self.terrain_slope_x / norm, self.terrain_slope_y / norm
         cross = u * nx + v * ny
         hemi = xp.where(o.lat >= 0, 1.0, -1.0)
         tx, ty = -ny * hemi, nx * hemi
         along = u * tx + v * ty
-        turn_sign = xp.where(xp.abs(along) > 0.1, xp.sign(along), 1.0)
+        turn_sign = xp.where(xp.abs(along) > float(tp.turn_speed_threshold),
+                             xp.sign(along), 1.0)
         block_rate = float(tp.blocking_rate) * block
         turn_rate = float(tp.deflection_rate) * block
         au = (-rough_drag * u - block_rate * cross * nx
@@ -557,10 +628,17 @@ class EarthModel:
         """冰/雪诊断(由温度决定)。"""
         xp, p = self.xp, self.cfg.physics
         if p.ice_albedo:
-            self.ice = (self.ocean *
-                        xp.clip((271.4 - self.Ts) / 2.0, 0, 1)).astype(xp.float32)
+            bounds = p.bounds
+            self.ice = (self.ocean * xp.clip(
+                (float(bounds.sea_ice_threshold_k) - self.Ts)
+                / float(bounds.sea_ice_transition_k),
+                float(bounds.cloud_min), float(bounds.cloud_max))
+                        ).astype(xp.float32)
             self.snow = (self.land *
-                         xp.clip((273.5 - self.Ts) / 6.0, 0, 1)).astype(xp.float32)
+                         xp.clip((float(bounds.snow_threshold_k) - self.Ts)
+                                 / float(bounds.snow_transition_k),
+                                 float(bounds.cloud_min),
+                                 float(bounds.cloud_max))).astype(xp.float32)
         else:
             self.ice = xp.zeros_like(self.Ts)
             self.snow = xp.zeros_like(self.Ts)
@@ -575,33 +653,48 @@ class EarthModel:
 
     def _step_once_legacy(self):
         xp, p, o, dt = self.xp, self.cfg.physics, self.ops, self.dt
+        bounds = p.bounds
+        pressure = p.pressure
+        rt = p.radiation_transfer
+        sf = p.surface_flux
+        mt = p.moisture_transport
         u, v, h, Ta, q, Ts = self.u, self.v, self.h, self.Ta, self.q, self.Ts
-        spd = xp.sqrt(u * u + v * v) + 1.0
+        spd = xp.sqrt(u * u + v * v) + float(sf.wind_speed_floor_ms)
 
         # ============ 辐射 ============
         Q_sw, decl, sub_lon = insolation(xp, o.lat, self.lons, self.t,
                                          p.S0, p.diurnal_cycle)
         self.subsolar = (float(decl), float(sub_lon))
         qs_a = qsat(xp, Ta)
-        rh = xp.clip(q / qs_a, 0, 1.3)
-        gq = xp.clip(q / 0.02, 0, 1)
+        rh = xp.clip(q / qs_a, float(mt.relative_humidity_min),
+                     float(bounds.relative_humidity_max))
+        gq = xp.clip(q / float(sf.humidity_greenhouse_scale), 0, 1)
 
         if p.radiation:
             alb_sfc = (self.ocean * (p.alb_ocean * (1 - self.ice) + p.alb_ice * self.ice)
                        + self.land * (p.alb_land * (1 - self.snow) + p.alb_snow * self.snow))
-            alb = xp.clip(alb_sfc + p.alb_cloud * self.cloud, 0, 0.85)
-            SW_sfc = Q_sw * (1 - alb) * 0.80          # 20% 被大气吸收/散射
-            SW_air = Q_sw * (1 - 0.30 * self.cloud) * 0.18
-            LW_up = 0.98 * SIGMA * Ts ** 4
-            eps_dn = xp.clip(0.60 + 0.25 * gq + 0.15 * self.cloud, 0, 0.98)
+            alb = xp.clip(alb_sfc + p.alb_cloud * self.cloud, 0,
+                          float(rt.albedo_max))
+            SW_sfc = Q_sw * (1 - alb) * float(rt.surface_sw_fraction)
+            SW_air = (Q_sw * (1 - float(rt.cloud_sw_absorption) * self.cloud)
+                      * float(rt.air_sw_fraction))
+            LW_up = float(rt.surface_emissivity) * SIGMA * Ts ** 4
+            eps_dn = xp.clip(float(rt.down_emissivity_base)
+                             + float(rt.down_emissivity_humidity) * gq
+                             + float(rt.down_emissivity_cloud) * self.cloud,
+                             0, float(rt.down_emissivity_max))
             LW_dn = eps_dn * SIGMA * Ta ** 4
-            olr_f = xp.clip(0.62 - 0.20 * gq - 0.08 * self.cloud, 0.28, 0.62)
+            olr_f = xp.clip(float(rt.olr_factor_base)
+                            - float(rt.olr_factor_humidity) * gq
+                            - float(rt.olr_factor_cloud) * self.cloud,
+                            float(rt.olr_factor_min),
+                            float(rt.olr_factor_max))
             OLR_air = olr_f * SIGMA * Ta ** 4
         else:
             SW_sfc = SW_air = LW_up = LW_dn = OLR_air = xp.zeros_like(Ta)
 
         # ============ 地表通量 ============
-        SH = 1.2e-3 * RHO_A * CP * spd * (Ts - Ta)
+        SH = float(sf.sensible_heat_coeff) * RHO_A * CP * spd * (Ts - Ta)
         if p.moisture:
             E, land_E = self._surface_evaporation(Ts, q, spd)
             LE = LV * E
@@ -612,17 +705,24 @@ class EarthModel:
         C_sfc = self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND
         Ts = Ts + dt * (SW_sfc + LW_dn - LW_up - SH - LE) / C_sfc
         # 海冰下海水温度下限
-        Ts = xp.where(self.ocean > 0.5, xp.maximum(Ts, 268.0), Ts)
+        Ts = xp.where(self.ocean > 0.5,
+                      xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
+                      Ts)
 
         # ============ 大气热力 + 水汽 ============
         Ta = o.adv_diff_step(Ta, u, v, p.diff_T, dt)
-        Ta = Ta + dt * (SH + SW_air + 0.85 * (LW_up - LW_dn) - OLR_air) / (MCOL * CP)
+        Ta = Ta + dt * (SH + SW_air + float(rt.air_longwave_coupling)
+                        * (LW_up - LW_dn) - OLR_air) / (MCOL * CP)
         if p.radiation:  # 向辐射平衡弱弛豫(保底约束, 防漂移)
-            Teq = 302.0 - 42.0 * xp.sin(o.lat) ** 2 + 8.0 * xp.sin(o.lat) * _np.sin(_np.radians(self.subsolar[0]) * 2)
+            Teq = (float(rt.seasonal_temp_base_k)
+                   - float(rt.seasonal_temp_pole_delta_k) * xp.sin(o.lat) ** 2
+                   + float(rt.seasonal_temp_amp_k) * xp.sin(o.lat)
+                   * _np.sin(_np.radians(self.subsolar[0]) * 2))
             Ta = Ta + dt / p.tau_relax_T * (Teq - Ta)
 
         # 风场辐散 (动力学与凝结共用)
-        div = o.ddx(u) + o.ddy(v * xp.cos(o.lat)) / xp.maximum(xp.cos(o.lat), 0.2)
+        div = (o.ddx(u) + o.ddy(v * xp.cos(o.lat))
+               / xp.maximum(xp.cos(o.lat), float(self.cfg.numerics.cos_clamp)))
 
         if p.moisture:
             q = o.adv_diff_step(q, u, v, p.diff_q, dt)
@@ -632,22 +732,28 @@ class EarthModel:
             rh_eff = self._effective_condensation_rh(div)
             exc = xp.maximum(q - rh_eff * qs_a, 0)
             # 辐散区(高压)下沉干燥 -> 副热带晴空/沙漠带
-            q = q * (1 - dt * 0.7 * xp.clip(div, 0, 1e-4))
+            q = q * (1 - dt * float(mt.subsidence_drying_coeff)
+                     * xp.clip(div, 0, float(mt.subsidence_divergence_max)))
             dq = exc * (1 - _np.exp(-dt / p.tau_cond))
             q = q - dq
             Ta = Ta + (LV / CP) * dq                      # 凝结潜热
             self.precip = (dq * MCOL / dt * 3600.0).astype(xp.float32)  # mm/h
             self._update_ground_water(land_E, dq * MCOL)
-            rh = xp.clip(q / qsat(xp, Ta), 0, 1.3)
+            rh = xp.clip(q / qsat(xp, Ta), float(mt.relative_humidity_min),
+                         float(bounds.relative_humidity_max))
             cl = self._diagnostic_cloud(rh, div)
             self.cloud = self._update_cloud_cover(cl, rh, div)
-            q = xp.clip(q, 0, 0.05)
+            q = xp.clip(q, float(bounds.humidity_min),
+                        float(bounds.humidity_max))
 
         # ============ 动力学 (湿浅水) ============
         h_eq = p.H0 - p.beta_T * (Ta - Ta.mean())
-        h = o.adv_diff_step(h, u, v, p.visc * 0.5, dt)
+        h = o.adv_diff_step(h, u, v,
+                            p.visc * float(pressure.thickness_diffusion_factor),
+                            dt)
         h = h + dt * (-h * div + (h_eq - h) / p.tau_h)
-        h = xp.clip(h, 0.4 * p.H0, 1.8 * p.H0)
+        h = xp.clip(h, float(pressure.thickness_min_factor) * p.H0,
+                    float(pressure.thickness_max_factor) * p.H0)
 
         dhdx, dhdy = o.ddx(h), o.ddy(h)
         u = o.adv_diff_step(u, u, v, p.visc, dt)
@@ -666,22 +772,31 @@ class EarthModel:
                  + dt * p.visc_ocean * o.lap(uo)
             vo = vo + dt * (p.tau_ocean * spd * v - p.drag_ocean * vo) \
                  + dt * p.visc_ocean * o.lap(vo)
-            uo, vo = o.coriolis_rotate(uo, vo, dt * 0.15)  # 埃克曼偏转(弱化)
+            uo, vo = o.coriolis_rotate(
+                uo, vo, dt * float(p.ocean_transport.ekman_coriolis_factor))
             open_o = self.ocean * (1 - self.ice)
-            self.uo = (xp.clip(uo, -2, 2) * open_o).astype(xp.float32)
-            self.vo = (xp.clip(vo, -2, 2) * open_o).astype(xp.float32)
+            max_current = float(bounds.ocean_current_max_ms)
+            self.uo = (xp.clip(uo, -max_current, max_current)
+                       * open_o).astype(xp.float32)
+            self.vo = (xp.clip(vo, -max_current, max_current)
+                       * open_o).astype(xp.float32)
             # 洋流输送热量
             Ts = xp.where(self.ocean > 0.5,
-                          o.adv_diff_step(Ts, self.uo, self.vo, 2e3, dt), Ts)
+                          o.adv_diff_step(
+                              Ts, self.uo, self.vo,
+                              float(p.ocean_transport.surface_heat_diffusivity),
+                              dt), Ts)
 
         # ============ 极区滤波 + 限幅 ============
         u, v, h = o.polar_filter(u), o.polar_filter(v), o.polar_filter(h)
         Ta, q = o.polar_filter(Ta), o.polar_filter(q)
         self.u, self.v = u.astype(xp.float32), v.astype(xp.float32)
         self.h = h.astype(xp.float32)
-        self.Ta = xp.clip(Ta, 160, 345).astype(xp.float32)
+        self.Ta = xp.clip(Ta, float(bounds.air_temp_min_k),
+                          float(bounds.air_temp_max_k)).astype(xp.float32)
         self.q = q.astype(xp.float32)
-        self.Ts = xp.clip(Ts, 170, 350).astype(xp.float32)
+        self.Ts = xp.clip(Ts, float(bounds.surface_temp_min_k),
+                          float(bounds.surface_temp_max_k)).astype(xp.float32)
         self._diag_surface()
 
         self.t += _dt.timedelta(seconds=self.dt)
@@ -690,32 +805,46 @@ class EarthModel:
     # ------------------------------------------------------------
     def _step_multilayer(self):
         xp, p, o, dt = self.xp, self.cfg.physics, self.ops, self.dt
+        bounds = p.bounds
+        pressure = p.pressure
+        rt = p.radiation_transfer
+        sf = p.surface_flux
+        mt = p.moisture_transport
         u, v = self.u_layers, self.v_layers
         h, Ta, q, Ts = self.h_layers, self.T_layers, self.q_layers, self.Ts
         u0, v0, Ta0, q0 = u[0], v[0], Ta[0], q[0]
-        spd = xp.sqrt(u0 * u0 + v0 * v0) + 1.0
+        spd = xp.sqrt(u0 * u0 + v0 * v0) + float(sf.wind_speed_floor_ms)
 
         Q_sw, decl, sub_lon = insolation(xp, o.lat, self.lons, self.t,
                                          p.S0, p.diurnal_cycle)
         self.subsolar = (float(decl), float(sub_lon))
-        gq = xp.clip(q0 / 0.02, 0, 1)
+        gq = xp.clip(q0 / float(sf.humidity_greenhouse_scale), 0, 1)
         if p.radiation:
             alb_sfc = (self.ocean * (p.alb_ocean * (1 - self.ice)
                        + p.alb_ice * self.ice)
                        + self.land * (p.alb_land * (1 - self.snow)
                        + p.alb_snow * self.snow))
-            alb = xp.clip(alb_sfc + p.alb_cloud * self.cloud, 0, 0.85)
-            SW_sfc = Q_sw * (1 - alb) * 0.80
-            SW_air = Q_sw * (1 - 0.30 * self.cloud) * 0.18
-            LW_up = 0.98 * SIGMA * Ts ** 4
-            eps_dn = xp.clip(0.60 + 0.25 * gq + 0.15 * self.cloud, 0, 0.98)
+            alb = xp.clip(alb_sfc + p.alb_cloud * self.cloud, 0,
+                          float(rt.albedo_max))
+            SW_sfc = Q_sw * (1 - alb) * float(rt.surface_sw_fraction)
+            SW_air = (Q_sw * (1 - float(rt.cloud_sw_absorption) * self.cloud)
+                      * float(rt.air_sw_fraction))
+            LW_up = float(rt.surface_emissivity) * SIGMA * Ts ** 4
+            eps_dn = xp.clip(float(rt.down_emissivity_base)
+                             + float(rt.down_emissivity_humidity) * gq
+                             + float(rt.down_emissivity_cloud) * self.cloud,
+                             0, float(rt.down_emissivity_max))
             LW_dn = eps_dn * SIGMA * Ta0 ** 4
-            olr_f = xp.clip(0.62 - 0.20 * gq - 0.08 * self.cloud, 0.28, 0.62)
+            olr_f = xp.clip(float(rt.olr_factor_base)
+                            - float(rt.olr_factor_humidity) * gq
+                            - float(rt.olr_factor_cloud) * self.cloud,
+                            float(rt.olr_factor_min),
+                            float(rt.olr_factor_max))
             OLR_air = olr_f * SIGMA * Ta0 ** 4
         else:
             SW_sfc = SW_air = LW_up = LW_dn = OLR_air = xp.zeros_like(Ta0)
 
-        SH = 1.2e-3 * RHO_A * CP * spd * (Ts - Ta0)
+        SH = float(sf.sensible_heat_coeff) * RHO_A * CP * spd * (Ts - Ta0)
         if p.moisture:
             E, land_E = self._surface_evaporation(Ts, q0, spd)
             LE = LV * E
@@ -723,25 +852,32 @@ class EarthModel:
             E = land_E = LE = xp.zeros_like(Ta0)
         C_sfc = self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND
         Ts = Ts + dt * (SW_sfc + LW_dn - LW_up - SH - LE) / C_sfc
-        Ts = xp.where(self.ocean > 0.5, xp.maximum(Ts, 268.0), Ts)
+        Ts = xp.where(self.ocean > 0.5,
+                      xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
+                      Ts)
 
         # Horizontal thermodynamics are integrated independently on each level.
-        seasonal = (302.0 - 42.0 * xp.sin(o.lat) ** 2
-                    + 8.0 * xp.sin(o.lat)
+        seasonal = (float(rt.seasonal_temp_base_k)
+                    - float(rt.seasonal_temp_pole_delta_k)
+                    * xp.sin(o.lat) ** 2
+                    + float(rt.seasonal_temp_amp_k) * xp.sin(o.lat)
                     * _np.sin(_np.radians(self.subsolar[0]) * 2))
-        lowest_mass = max(float(self.layer_mass_fractions[0]), 0.02)
+        lowest_mass = max(float(self.layer_mass_fractions[0]),
+                          float(p.vertical.lowest_layer_mass_min))
         Ta_out, q_out, div_out = [], [], []
         for k in range(self.nz):
             Tk = o.adv_diff_step(Ta[k], u[k], v[k], p.diff_T, dt)
             if k == 0:
-                Tk += dt * (SH + SW_air + 0.85 * (LW_up - LW_dn)
+                Tk += dt * (SH + SW_air + float(rt.air_longwave_coupling)
+                            * (LW_up - LW_dn)
                             - OLR_air) / (MCOL * lowest_mass * CP)
             if p.radiation:
                 Teq = seasonal - float(p.vertical.lapse_rate) * self.levels_m[k]
                 Tk += dt / p.tau_relax_T * (Teq - Tk)
             Ta_out.append(Tk)
             divk = (o.ddx(u[k]) + o.ddy(v[k] * xp.cos(o.lat))
-                    / xp.maximum(xp.cos(o.lat), 0.2))
+                    / xp.maximum(xp.cos(o.lat),
+                                 float(self.cfg.numerics.cos_clamp)))
             div_out.append(divk)
             if p.moisture:
                 qk = o.adv_diff_step(q[k], u[k], v[k], p.diff_q, dt)
@@ -759,13 +895,15 @@ class EarthModel:
             rh_eff = self._effective_condensation_rh(div)
             dq = xp.maximum(q - rh_eff * qs_a, 0) * (
                 1 - _np.exp(-dt / p.tau_cond))
-            q *= 1 - dt * 0.7 * xp.clip(div, 0, 1e-4)
+            q *= 1 - dt * float(mt.subsidence_drying_coeff) * xp.clip(
+                div, 0, float(mt.subsidence_divergence_max))
             q -= dq
             Ta += (LV / CP) * dq
             column_dq = (dq * self._mass3).sum(axis=0)
             self.precip = (column_dq * MCOL / dt * 3600.0).astype(xp.float32)
             self._update_ground_water(land_E, column_dq * MCOL)
-            rh = xp.clip(q / qsat(xp, Ta), 0, 1.3)
+            rh = xp.clip(q / qsat(xp, Ta), float(mt.relative_humidity_min),
+                         float(bounds.relative_humidity_max))
             cl = self._diagnostic_cloud(rh, div)
             self.cloud = self._update_cloud_cover(cl, rh, div)
 
@@ -773,9 +911,12 @@ class EarthModel:
         h_out, u_out, v_out = [], [], []
         for k in range(self.nz):
             h_eq = p.H0 - p.beta_T * (Ta[k] - Ta[k].mean())
-            hk = o.adv_diff_step(h[k], u[k], v[k], p.visc * 0.5, dt)
+            hk = o.adv_diff_step(
+                h[k], u[k], v[k],
+                p.visc * float(pressure.thickness_diffusion_factor), dt)
             hk += dt * (-hk * div[k] + (h_eq - hk) / p.tau_h)
-            hk = xp.clip(hk, 0.4 * p.H0, 1.8 * p.H0)
+            hk = xp.clip(hk, float(pressure.thickness_min_factor) * p.H0,
+                         float(pressure.thickness_max_factor) * p.H0)
             uk = o.adv_diff_step(u[k], u[k], v[k], p.visc, dt)
             vk = o.adv_diff_step(v[k], u[k], v[k], p.visc, dt)
             terrain_u, terrain_v = self._terrain_acceleration(uk, vk, k)
@@ -806,10 +947,15 @@ class EarthModel:
         q = o.polar_filter(q)
         self.u_layers = xp.clip(u, -p.umax, p.umax).astype(xp.float32)
         self.v_layers = xp.clip(v, -p.umax, p.umax).astype(xp.float32)
-        self.h_layers = xp.clip(h, 0.4 * p.H0, 1.8 * p.H0).astype(xp.float32)
-        self.T_layers = xp.clip(Ta, 160, 345).astype(xp.float32)
-        self.q_layers = xp.clip(q, 0, 0.05).astype(xp.float32)
-        self.Ts = xp.clip(Ts, 170, 350).astype(xp.float32)
+        self.h_layers = xp.clip(
+            h, float(pressure.thickness_min_factor) * p.H0,
+            float(pressure.thickness_max_factor) * p.H0).astype(xp.float32)
+        self.T_layers = xp.clip(Ta, float(bounds.air_temp_min_k),
+                                float(bounds.air_temp_max_k)).astype(xp.float32)
+        self.q_layers = xp.clip(q, float(bounds.humidity_min),
+                                float(bounds.humidity_max)).astype(xp.float32)
+        self.Ts = xp.clip(Ts, float(bounds.surface_temp_min_k),
+                          float(bounds.surface_temp_max_k)).astype(xp.float32)
         self._sync_surface_views()
         self._diag_surface()
         self.t += _dt.timedelta(seconds=self.dt)
@@ -820,6 +966,7 @@ class EarthModel:
         """在 (lat, lon) 为中心、radius_km 为尺度的高斯区域内
         增减温度 delta (K)。target: surface / air / both。"""
         xp = self.xp
+        bounds, edit = self.cfg.physics.bounds, self.cfg.physics.edit
         la0 = _np.radians(float(lat_deg))
         lo0 = _np.radians(float(lon_deg) % 360.0)
         la = self.ops.lat                                  # [nlat,1] 弧度
@@ -828,29 +975,43 @@ class EarthModel:
         cosd = (xp.sin(la) * _np.sin(la0) +
                 xp.cos(la) * _np.cos(la0) * xp.cos(lo - lo0))
         d_km = xp.arccos(xp.clip(cosd, -1.0, 1.0)) * (A_EARTH / 1000.0)
-        w = xp.exp(-(d_km / max(float(radius_km), 50.0)) ** 2)
+        w = xp.exp(-(d_km / max(float(radius_km),
+                                float(edit.min_radius_km))) ** 2)
         dT = (float(delta) * w).astype(xp.float32)
         if target in ("surface", "both"):
-            self.Ts = xp.clip(self.Ts + dT, 170, 350).astype(xp.float32)
+            self.Ts = xp.clip(
+                self.Ts + dT, float(bounds.surface_temp_min_k),
+                float(bounds.surface_temp_max_k)).astype(xp.float32)
             # 变暖立即消融冰雪 / 骤冷时下一步会重新诊断
             if float(delta) > 0:
-                melt = xp.clip((self.Ts - 271.4) / 2.0, 0, 1)
+                melt = xp.clip((self.Ts - float(bounds.sea_ice_threshold_k))
+                               / float(bounds.sea_ice_transition_k),
+                               float(bounds.cloud_min), float(bounds.cloud_max))
                 self.ice = xp.minimum(self.ice, 1 - melt * self.ocean)
-                melt_l = xp.clip((self.Ts - 273.5) / 6.0, 0, 1)
+                melt_l = xp.clip((self.Ts - float(bounds.snow_threshold_k))
+                                 / float(bounds.snow_transition_k),
+                                 float(bounds.cloud_min),
+                                 float(bounds.cloud_max))
                 self.snow = xp.minimum(self.snow, 1 - melt_l * self.land)
         if target in ("air", "both"):
             old_T = self.T_layers[0].copy()
-            self.T_layers[0] = xp.clip(old_T + dT, 160, 345).astype(xp.float32)
+            self.T_layers[0] = xp.clip(
+                old_T + dT, float(bounds.air_temp_min_k),
+                float(bounds.air_temp_max_k)).astype(xp.float32)
             # 保持相对湿度不突变: 随饱和比湿同步缩放水汽
             self.q_layers[0] = xp.clip(
                 self.q_layers[0] * qsat(xp, self.T_layers[0]) /
-                qsat(xp, old_T), 0, 0.04).astype(xp.float32)
+                qsat(xp, old_T), float(bounds.humidity_min),
+                float(edit.air_humidity_max)).astype(xp.float32)
             self._sync_surface_views()
 
     # ------------------------------------------------------------
     def pressure_hpa(self):
         """把厚度场映射为习惯的海平面气压 (hPa), 仅用于展示。"""
-        return 1013.0 + (self.h - self.cfg.physics.H0) * 0.045
+        pressure = self.cfg.physics.pressure
+        return (float(pressure.mslp_reference_hpa)
+                + (self.h - self.cfg.physics.H0)
+                * float(pressure.hpa_per_thickness_m))
 
     def fields_cpu(self, include_layers=False):
         """导出全部展示字段到 numpy。"""

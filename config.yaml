@@ -1,15 +1,14 @@
 # ============================================================
-# EarthSim 全局配置文件
-# 所有物理 / 数值 / 服务器超参数都在这里调节
+# EarthSim global configuration
+# All physical, numerical, precompute, and server parameters live here.
 # ============================================================
 
-backend: cuda            # auto | cuda | cpu   (cuda 需要安装 cupy)
+backend: cuda            # auto | cuda | cpu
 
 grid:
-  nlat: 360               # 纬向格点数 (2° 分辨率)。提高精度: 180 (1°), 360 (0.5°)
-  nlon: 720             # 经向格点数,一般取 nlat*2
-  topo_file: data/etopo2022_60s.npz   # 当前可用的 ETOPO 2022 60" 地形
-
+  nlat: 360              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
+  nlon: 720              # usually nlat*2
+  topo_file: data/etopo2022_60s.npz
   topo_files:
     - data/etopo2022_60s.npz
     - data/etopo20.npz
@@ -20,148 +19,238 @@ time:
   spinup_days: 0
 
 data:
-  # real: 文件存在且必须成功；auto: 文件存在时真实初始化，否则使用理想场
-  init_mode: ideal
-
-
-  # 推荐将 ERA5 压力层和单层文件放在这里；也可以把二者合并成一个 NetCDF
+  init_mode: ideal       # ideal | auto | real
   atmosphere_file: data/era5_pressure_levels.nc
   surface_file: data/era5_single_levels.nc
-  # 可选：Copernicus Marine/CMEMS 海表流速与海温 NetCDF
   ocean_file: data/cmems_surface_currents.nc
-  init_time: ""       # 空值表示使用 time.start，按最近时次选择
+  init_time: ""          # empty means time.start
 
 physics:
-  # ---- 模型选择开关 ----
-  moisture: true         # 水汽循环(蒸发/凝结/降水/潜热)
-  radiation: true        # 太阳短波 + 长波辐射(含昼夜与季节)
-  ocean: true            # 平板海洋 + 风生洋流
-  ice_albedo: true       # 冰雪反照率反馈
-  diurnal_cycle: true    # 昼夜循环(关闭则使用日平均入射)
+  moisture: true
+  radiation: true
+  ocean: true
+  ice_albedo: true
+  diurnal_cycle: true
 
-  # ---- 动力学 ----
-  H0: 8000.0              # 等效大气厚度 (m) —— 决定重力波速 sqrt(g_eff*H0)
-  g_eff: 9.8             # 有效重力 (m/s^2)
-  beta_T: 22.0           # 热力强迫系数 (m/K): 暖区 -> 低压
-  tau_h: 43200.0         # 厚度场向热力平衡弛豫时间 (s)
-  drag: 6.0e-6           # 旧版统一大气摩擦回退值 (1/s)
-  drag_ocean_atmosphere: 4.0e-6 # 海洋上空近地层大气摩擦 (1/s)
-  drag_land_atmosphere: 1.2e-5 # 陆地上空近地层大气摩擦 (1/s)
-  visc: 8.0e+4            # 动量水平扩散 (m^2/s)
-  diff_T: 4.0e+4          # 温度扩散
-  diff_q: 2.0e+4          # 水汽扩散
-  umax: 150            # 风速限幅 (m/s)
+  H0: 8000.0
+  g_eff: 9.8
+  beta_T: 22.0
+  tau_h: 43200.0
+  drag: 6.0e-6
+  drag_ocean_atmosphere: 4.0e-6
+  drag_land_atmosphere: 1.2e-5
+  visc: 8.0e+4
+  diff_T: 4.0e+4
+  diff_q: 2.0e+4
+  umax: 150
 
-  # ---- 辐射 ----
-  S0: 1361.0             # 太阳常数 (W/m^2)
+  S0: 1361.0
   alb_ocean: 0.07
   alb_land: 0.22
   alb_ice: 0.62
   alb_snow: 0.70
-  alb_cloud: 0.42        # 云反照率贡献 (乘以云量)
-  tau_relax_T: 864000.0  # 大气温度向辐射平衡弛豫 (s) —— 保底约束, 10 天
+  alb_cloud: 0.42
+  tau_relax_T: 864000.0
 
-  # ---- 水汽 ----
-  rh_crit: 0.90          # 凝结临界相对湿度
-  tau_cond: 5400.0       # 凝结时间尺度 (s)
-  c_evap: 9.0e-4         # 蒸发系数
-  convective_rh_drop_max: 0.12 # 辐合最多降低的凝结 RH 阈值
-  convective_div_scale: 3.0e-5 # 达到最大对流增强所需的辐合强度 (1/s)
-  cloud_rh_start: 0.70   # 诊断云开始形成的相对湿度
-  cloud_rh_full: 0.95    # 诊断云接近满云的相对湿度
-  cloud_rh_exponent: 1.6 # 云量随 RH 增长的非线性指数
-  tau_cloud_form: 1800.0  # 云量向诊断云形成的时间尺度 (s)
-  tau_cloud_dissip: 3000.0 # 无支撑云量的基础耗散时间尺度 (s)
-  cloud_clear_rh: 0.72   # 低于该相对湿度时增强云耗散
-  cloud_dry_clear: 4.0   # 干燥清除增强倍数
-  cloud_subsidence_clear: 3.0 # 下沉/辐散清除增强倍数
-  cloud_precip_clear: 2 # 降水雨洗清除增强倍数
-  cloud_precip_scale: 0.5 # 雨洗归一化降水强度 (mm/h)
-  init_surface_rh: 0.58  # 理想初始场近地层相对湿度
-  init_upper_rh: 0.28    # 理想初始场高层相对湿度
-  ideal_wave_amp_K: 1.2  # 理想初始场温度扰动, 打破经向均匀
-  ideal_humidity_wave: 0.10 # 理想初始场湿度扰动比例
-  land_evap: 0.05        # 完全湿润陆面的蒸发相对海面的比例
-  ground_water_capacity_mm: 150.0 # 地面储水上限（等效水深 mm）
-  initial_ground_water_mm: 60.0 # 理想初始场陆地储水（mm）
-  ground_evap_exponent: 1.0 # 湿润度对陆面蒸发的幂指数
-  ground_runoff_tau: 864000.0 # 地面满水时的河流外排时间尺度（s，10 天）
-  ground_runoff_exponent: 2.0 # 外排幂指数；必须 >1，越大则湿地流失加速越明显
+  initial_conditions:
+    equilibrium_temp_base_k: 308.0
+    equilibrium_temp_pole_delta_k: 42.0
+    surface_lapse_rate: 0.0065
+    humidity_decay_height_m: 4500.0
+    temp_wave_lon1: 3.0
+    temp_wave_phase1: 0.7
+    temp_wave_weight2: 0.5
+    temp_wave_lon2: 5.0
+    temp_wave_phase2: -1.3
+    temp_wave_decay_height_m: 7000.0
+    real_default_temp_k: 280.0
+    real_default_humidity: 0.01
+    real_default_mslp_hpa: 1013.0
 
-    # ---- 初始风场 ----
-  ideal_wind_enabled: true # ideal 初始化时启用先验风场
-  ideal_trade_wind_ms: 5.0 # 热带近地层东风强度
-  ideal_surface_westerly_ms: 4.0 # 中纬近地层西风强度
-  ideal_jet_ms: 22.0      # 中纬高空西风急流强度
-  ideal_polar_easterly_ms: 2.5 # 极地低层东风强度
-  ideal_jet_lat_deg: 42.0 # 西风急流中心纬度
-  ideal_jet_width_deg: 12.0 # 西风急流纬向宽度
-  ideal_jet_height_m: 9000.0 # 西风急流中心高度
-  ideal_jet_depth_m: 4500.0 # 西风急流垂直厚度
-  ideal_wind_wave_ms: 1.2 # 天气尺度扰动风, 加速形成错落结构
+  bounds:
+    air_temp_min_k: 160.0
+    air_temp_max_k: 345.0
+    surface_temp_min_k: 170.0
+    surface_temp_max_k: 350.0
+    ocean_initial_min_temp_k: 271.2
+    ocean_freezing_min_temp_k: 268.0
+    sea_ice_threshold_k: 271.4
+    sea_ice_transition_k: 2.0
+    snow_threshold_k: 273.5
+    snow_transition_k: 6.0
+    humidity_min: 0.0
+    humidity_max: 0.05
+    cloud_min: 0.0
+    cloud_max: 1.0
+    precip_max_mmh: 1.2
+    ocean_current_max_ms: 2.0
+    relative_humidity_max: 1.3
 
+  radiation_transfer:
+    albedo_max: 0.85
+    surface_sw_fraction: 0.80
+    cloud_sw_absorption: 0.30
+    air_sw_fraction: 0.18
+    surface_emissivity: 0.98
+    down_emissivity_base: 0.60
+    down_emissivity_humidity: 0.25
+    down_emissivity_cloud: 0.15
+    down_emissivity_max: 0.98
+    olr_factor_base: 0.62
+    olr_factor_humidity: 0.20
+    olr_factor_cloud: 0.08
+    olr_factor_min: 0.28
+    olr_factor_max: 0.62
+    air_longwave_coupling: 0.85
+    seasonal_temp_base_k: 302.0
+    seasonal_temp_pole_delta_k: 42.0
+    seasonal_temp_amp_k: 8.0
 
-  # ---- 海洋 ----
-  mld: 40.0              # 海洋混合层深度 (m), 决定海洋热惯性
-  tau_ocean: 8.0e-7      # 风应力 -> 洋流 传递系数
-  drag_ocean: 1.5e-6     # 洋流阻尼
-  visc_ocean: 4.0e+4      # 洋流扩散
+  surface_flux:
+    wind_speed_floor_ms: 1.0
+    sensible_heat_coeff: 1.2e-3
+    humidity_greenhouse_scale: 0.02
+
+  moisture_transport:
+    subsidence_drying_coeff: 0.7
+    subsidence_divergence_max: 1.0e-4
+    precip_cloud_diagnostic_scale_mmh: 2.0
+    cloud_subsidence_scale: 1.5e5
+    cloud_subsidence_clear_max: 2.0
+    cloud_subsidence_cover_max: 0.45
+    relative_humidity_min: 0.0
+    effective_rh_max: 1.2
+
+  pressure:
+    mslp_reference_hpa: 1013.0
+    thickness_per_hpa: 22.22222222222222
+    hpa_per_thickness_m: 0.045
+    thickness_min_factor: 0.4
+    thickness_max_factor: 1.8
+    thickness_diffusion_factor: 0.5
+
+  rh_crit: 0.90
+  tau_cond: 5400.0
+  c_evap: 9.0e-4
+  convective_rh_drop_max: 0.12
+  convective_div_scale: 3.0e-5
+  cloud_rh_start: 0.70
+  cloud_rh_full: 0.95
+  cloud_rh_exponent: 1.6
+  tau_cloud_form: 1800.0
+  tau_cloud_dissip: 3000.0
+  cloud_clear_rh: 0.72
+  cloud_dry_clear: 4.0
+  cloud_subsidence_clear: 3.0
+  cloud_precip_clear: 2
+  cloud_precip_scale: 0.5
+  init_surface_rh: 0.58
+  init_upper_rh: 0.28
+  ideal_wave_amp_K: 1.2
+  ideal_humidity_wave: 0.10
+  land_evap: 0.05
+  ground_water_capacity_mm: 150.0
+  initial_ground_water_mm: 60.0
+  ground_evap_exponent: 1.0
+  ground_runoff_tau: 864000.0
+  ground_runoff_exponent: 2.0
+
+  ideal_wind_enabled: true
+  ideal_trade_wind_ms: 5.0
+  ideal_surface_westerly_ms: 4.0
+  ideal_jet_ms: 22.0
+  ideal_polar_easterly_ms: 2.5
+  ideal_jet_lat_deg: 42.0
+  ideal_jet_width_deg: 12.0
+  ideal_jet_height_m: 9000.0
+  ideal_jet_depth_m: 4500.0
+  ideal_wind_wave_ms: 1.2
+  ideal_wind_shape:
+    trade_lat_width_deg: 23.0
+    trade_decay_height_m: 3500.0
+    surface_westerly_lat_deg: 48.0
+    surface_westerly_width_deg: 18.0
+    surface_westerly_decay_height_m: 4500.0
+    polar_easterly_lat_deg: 72.0
+    polar_easterly_width_deg: 11.0
+    polar_easterly_decay_height_m: 5500.0
+    wave_decay_height_m: 9000.0
+    wave_u_fraction: 0.6
+    wave_wavenumber: 4.0
+    wave_phase: 0.8
+
+  mld: 40.0
+  tau_ocean: 8.0e-7
+  drag_ocean: 1.5e-6
+  visc_ocean: 4.0e+4
+  ocean_transport:
+    wind_speed_floor_ms: 1.0
+    ekman_coriolis_factor: 0.15
+    surface_heat_diffusivity: 2.0e3
   ocean_layers:
-    enabled: true          # two active ocean layers; mld remains the upper-layer depth
-    lower_depth_m: 200.0   # deep-layer thickness (m)
-    deep_initial_offset_k: 1.5 # initial deep water temperature below SST (K)
-    interlayer_drag: 2.0e-7 # upper/deep momentum exchange (1/s)
-    interlayer_heat_exchange: 1.0e-7 # upper/deep heat exchange (1/s)
-    deep_drag: 3.0e-7      # deep current bottom damping (1/s)
-    deep_visc: 2.0e+4      # deep current and temperature horizontal diffusion (m^2/s)
-    deep_temp_min_k: 268.0 # numerical lower bound for deep-water temperature
+    enabled: true
+    lower_depth_m: 200.0
+    deep_initial_offset_k: 1.5
+    interlayer_drag: 2.0e-7
+    interlayer_heat_exchange: 1.0e-7
+    deep_drag: 3.0e-7
+    deep_visc: 2.0e+4
+    deep_temp_min_k: 268.0
 
-  # ---- 大气垂直分层与层间动力学 ----
   vertical:
     enabled: true
-    levels_m: [100, 1000,2000, 3000, 6000, 10000] # 各层中心海拔 (m)，必须严格递增
-    lapse_rate: 0.0065     # 环境温度直减率 (K/m)
-    scale_height: 8000.0   # 气压/层质量指数衰减尺度高度 (m)
-    continuity_relax: 1800.0 # 垂直速度向质量连续诊断值调整的时间 (s)
-    buoyancy_factor: 1.5e-4 # 气柱相对环境直减率异常产生浮力的强度
-    w_damping: 5.0e-4      # 垂直速度阻尼 (1/s)
-    w_max: 20             # 垂直速度限幅 (m/s)
-    diff_momentum: 12.0    # 层间动量交换系数 (m^2/s)
-    diff_heat: 8.0         # 层间热交换系数 (m^2/s)
-    diff_moisture: 5.0     # 层间水汽交换系数 (m^2/s)
+    levels_m: [100, 1000, 2000, 3000, 6000, 10000]
+    lapse_rate: 0.0065
+    scale_height: 8000.0
+    scale_height_min_m: 1000.0
+    continuity_relax: 1800.0
+    buoyancy_factor: 1.5e-4
+    w_damping: 5.0e-4
+    w_max: 20
+    buoyancy_temp_min_k: 180.0
+    lowest_layer_mass_min: 0.02
+    diff_momentum: 12.0
+    diff_heat: 8.0
+    diff_moisture: 5.0
 
-  # ---- 地形对近地层风的作用 ----
   topography:
     enabled: true
-    smooth_passes: 2       # 计算坡度前的 1-2-1 地形平滑次数
-    influence_height: 2500.0 # 地形作用随高度衰减的尺度 (m)
-    elevation_scale: 1500.0 # 海拔阻力达到显著强度的尺度 (m)
-    slope_scale: 0.02      # 坡度阻挡达到显著强度的尺度 (m/m)
-    drag_multiplier: 8.0  # 高地粗糙度相对基础 drag 的增强倍数
-    blocking_rate: 8.0e-4 # 跨山风分量阻挡率 (1/s)
-    deflection_rate: 3.0e-4 # 沿等高线偏转率 (1/s)
-    lift_efficiency: 0.3   # 水平迎坡速度转为垂直速度的比例
-    lift_max: 10          # 地形抬升/下沉速度限幅 (m/s)
+    smooth_passes: 2
+    smooth_center_weight: 0.5
+    smooth_neighbor_weight: 0.25
+    influence_height: 2500.0
+    elevation_scale: 1500.0
+    slope_scale: 0.02
+    drag_multiplier: 8.0
+    blocking_rate: 8.0e-4
+    deflection_rate: 3.0e-4
+    lift_efficiency: 0.3
+    lift_max: 10
+    slope_min: 1.0e-6
+    turn_speed_threshold: 0.1
+
+  edit:
+    min_radius_km: 50.0
+    air_humidity_max: 0.04
 
 numerics:
-  advection: upwind      # 平流格式 (目前: upwind)
-  cos_clamp: 0.1         # 高纬 cos(lat) 下限(防极点奇异)
-  polar_filter_lat: 88.0 # 该纬度以上启用纬向滤波
+  advection: upwind
+  cos_clamp: 0.2
+  polar_filter_lat: 88.0
   polar_filter_passes: 6
 
-# 离线预演算(先算好再回放, 精度可以开高)
 precompute:
   out_dir: output/run1
-  days: 3                # 演算总天数
-  save_every_steps: 15   # 每多少步存一帧 (15*240s = 1h/帧)
+  days: 3
+  save_every_steps: 15
 
 server:
   host: 0.0.0.0
   port: 8000
-  steps_per_frame: 2     # 实时模式下每推送一帧走多少物理步
-  max_fps: 60            # 推送帧率上限
-  vector_stride: 5       # 风场/洋流矢量抽稀间隔
-  basemap_width: 2160    # 地球基础贴图宽度；首启会重新生成
-  record_enabled: true   # 实时演算默认写入可回放帧
+  steps_per_frame: 5
+  max_fps: 60
+  vector_stride: 5
+  basemap_width: 2160
+  record_enabled: true
   record_dir: output/recordings
-  record_every_steps: 600 # 每 N 个物理步保存一帧
+  record_every_steps: 600
