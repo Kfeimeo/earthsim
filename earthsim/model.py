@@ -1005,6 +1005,65 @@ class EarthModel:
                 float(edit.air_humidity_max)).astype(xp.float32)
             self._sync_surface_views()
 
+    def _regional_weight(self, lat_deg, lon_deg, radius_km):
+        xp = self.xp
+        min_radius = float(getattr(self.cfg.physics.edit, "min_radius_km", 50.0))
+        la0 = _np.radians(float(lat_deg))
+        lo0 = _np.radians(float(lon_deg) % 360.0)
+        lo = xp.asarray(_np.radians(self.lons), dtype=xp.float32)[None, :]
+        cosd = (xp.sin(self.ops.lat) * _np.sin(la0)
+                + xp.cos(self.ops.lat) * _np.cos(la0) * xp.cos(lo - lo0))
+        d_km = xp.arccos(xp.clip(cosd, -1.0, 1.0)) * (A_EARTH / 1000.0)
+        radius = max(float(radius_km), min_radius)
+        return d_km, xp.exp(-(d_km / radius) ** 2).astype(xp.float32)
+
+    def _selected_wind_layers(self, layer=None):
+        if layer is None or str(layer).lower() == "all":
+            return range(self.nz)
+        return [int(_np.clip(int(layer), 0, self.nz - 1))]
+
+    def apply_wind_zero_edit(self, lat_deg, lon_deg, radius_km=800.0,
+                             layer=None):
+        """Damp horizontal wind to zero inside a Gaussian edit region."""
+        xp = self.xp
+        _, w = self._regional_weight(lat_deg, lon_deg, radius_km)
+        keep = (1.0 - w).astype(xp.float32)
+        for k in self._selected_wind_layers(layer):
+            self.u_layers[k] = (self.u_layers[k] * keep).astype(xp.float32)
+            self.v_layers[k] = (self.v_layers[k] * keep).astype(xp.float32)
+        self._sync_surface_views()
+
+    def apply_cyclone_edit(self, lat_deg, lon_deg, radius_km=900.0,
+                           strength_ms=35.0, layer=None):
+        """Add a compact cyclonic vortex to the selected wind layer(s)."""
+        xp, p = self.xp, self.cfg.physics
+        d_km, _ = self._regional_weight(lat_deg, lon_deg, radius_km)
+        radius = max(float(radius_km), float(getattr(p.edit, "min_radius_km", 50.0)))
+        r = xp.maximum(d_km / radius, 1.0e-4)
+        speed = float(strength_ms) * r * xp.exp(0.5 * (1.0 - r * r))
+
+        la0 = _np.radians(float(lat_deg))
+        lo0 = _np.radians(float(lon_deg) % 360.0)
+        la = self.ops.lat
+        lo = xp.asarray(_np.radians(self.lons), dtype=xp.float32)[None, :]
+        dlon = lo - lo0
+        sin_c = xp.maximum(xp.sin(d_km / (A_EARTH / 1000.0)), 1.0e-4)
+        radial_east = _np.cos(la0) * xp.sin(dlon) / sin_c
+        radial_north = (_np.cos(la0) * xp.sin(la)
+                        - _np.sin(la0) * xp.cos(la) * xp.cos(dlon)) / sin_c
+        spin = 1.0 if float(lat_deg) >= 0.0 else -1.0
+        du = (-spin * radial_north * speed).astype(xp.float32)
+        dv = (spin * radial_east * speed).astype(xp.float32)
+
+        max_wind = float(getattr(p.edit, "cyclone_max_wind_ms", p.umax))
+        max_wind = min(max_wind, float(p.umax))
+        for k in self._selected_wind_layers(layer):
+            self.u_layers[k] = xp.clip(
+                self.u_layers[k] + du, -max_wind, max_wind).astype(xp.float32)
+            self.v_layers[k] = xp.clip(
+                self.v_layers[k] + dv, -max_wind, max_wind).astype(xp.float32)
+        self._sync_surface_views()
+
     # ------------------------------------------------------------
     def pressure_hpa(self):
         """把厚度场映射为习惯的海平面气压 (hPa), 仅用于展示。"""

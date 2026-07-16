@@ -199,6 +199,7 @@ DEFAULTS = {
         "edit": {
             "min_radius_km": 50.0,
             "air_humidity_max": 0.04,
+            "cyclone_max_wind_ms": 120.0,
         },
     },
     "numerics": {"advection": "upwind", "cos_clamp": 0.2,

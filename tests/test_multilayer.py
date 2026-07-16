@@ -71,6 +71,26 @@ class MultilayerModelTests(unittest.TestCase):
         self.assertGreater(float(np.max(model.T_layers[0] - before)), 2.5)
         self.assertTrue(np.shares_memory(model.Ta, model.T_layers))
 
+    def test_wind_region_edits_update_selected_layer(self):
+        model = EarthModel(small_config())
+        lat = float(model.lats[6])
+        layer = 1
+        model.u_layers[layer][6, 0] = 20.0
+        model.v_layers[layer][6, 0] = 10.0
+
+        model.apply_wind_zero_edit(lat, 0, radius_km=700, layer=layer)
+
+        self.assertLess(float(np.hypot(model.u_layers[layer][6, 0],
+                                       model.v_layers[layer][6, 0])), 5.0)
+        surface_before = model.u_layers[0].copy()
+
+        model.apply_cyclone_edit(lat, 0, radius_km=900,
+                                 strength_ms=35, layer=layer)
+
+        self.assertGreater(float(np.hypot(model.u_layers[layer],
+                                          model.v_layers[layer]).max()), 5.0)
+        np.testing.assert_allclose(model.u_layers[0], surface_before)
+
     def test_vertical_transport_conserves_layer_integral(self):
         model = EarthModel(small_config())
         field = np.linspace(260, 300, model.nz, dtype=np.float32)[:, None, None]

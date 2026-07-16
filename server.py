@@ -111,6 +111,7 @@ class Hub:
         stride = self._clip_vector_stride(cfg.server.vector_stride)
         self.vector_strides = {"wind": stride, "ocean": stride}
         self.wind_layer_index = 0
+        self.ocean_layer_index = 0
         if playback_dir:
             self.recorder = None
             self.player = FramePlayer(playback_dir)
@@ -176,6 +177,11 @@ class Hub:
     def _has_layer_winds(self, f):
         return self.model is not None or ("u_layers" in f and "v_layers" in f)
 
+    def _has_ocean_layers(self, f):
+        if self.model is not None:
+            return bool(getattr(self.model, "ocean_layers_enabled", False))
+        return "uo_deep" in f and "vo_deep" in f
+
     def _wind_components(self, f):
         k = self._clip_atmosphere_layer(self.wind_layer_index)
         self.wind_layer_index = k
@@ -185,18 +191,35 @@ class Hub:
             return f["u_layers"][k], f["v_layers"][k]
         return f["u"], f["v"]
 
+    def _clip_ocean_layer(self, k):
+        n = 2 if self._has_ocean_layers(self.fields) else 1
+        return int(np.clip(int(k), 0, n - 1))
+
+    def _ocean_components(self, f):
+        k = self._clip_ocean_layer(self.ocean_layer_index)
+        self.ocean_layer_index = k
+        if k == 1:
+            if self.model:
+                return to_cpu(self.model.uo_deep), to_cpu(self.model.vo_deep)
+            return f.get("uo_deep", f["uo"]), f.get("vo_deep", f["vo"])
+        return f["uo"], f["vo"]
+
     # -------- 帧编码 --------
     def packet(self):
         f = self.fields
         if not self._has_layer_winds(f):
             self.wind_layer_index = 0
+        if not self._has_ocean_layers(f):
+            self.ocean_layer_index = 0
         meta = {"type": "frame", "time": self.time_iso,
                 "mode": self.mode, "playing": self.playing,
                 "speed": self.speed, "layers": [], "vecs": [],
                 "shape": [len(self.lats), len(self.lons)],
                 "vector_strides": dict(self.vector_strides),
                 "wind_layer_index": self._clip_atmosphere_layer(self.wind_layer_index),
-                "wind_layer_available": self._has_layer_winds(f)}
+                "wind_layer_available": self._has_layer_winds(f),
+                "ocean_layer_index": self._clip_ocean_layer(self.ocean_layer_index),
+                "ocean_layer_available": self._has_ocean_layers(f)}
         meta["atmosphere_levels_m"] = self._atmosphere_levels()
         if self.mode == "playback":
             meta["frame"], meta["nframes"] = self.idx, self.player.n
@@ -223,7 +246,7 @@ class Hub:
             if name == "wind":
                 u, v = self._wind_components(f)
             else:
-                u, v = f[cu], f[cv]
+                u, v = self._ocean_components(f)
             vec = np.stack([u[::stride, ::stride],
                             v[::stride, ::stride]], -1).astype(np.float32)
             b = vec.tobytes()
@@ -301,6 +324,10 @@ class Hub:
             self.wind_layer_index = self._clip_atmosphere_layer(
                 msg.get("value", self.wind_layer_index))
             await self.broadcast()
+        elif cmd == "set_ocean_layer":
+            self.ocean_layer_index = self._clip_ocean_layer(
+                msg.get("value", self.ocean_layer_index))
+            await self.broadcast()
         elif cmd == "edit_temp" and self.mode == "live":
             def _edit():
                 self.model.apply_temp_edit(
@@ -312,6 +339,29 @@ class Hub:
                 self.fields = self.model.fields_cpu()
             await asyncio.to_thread(_edit)
             if not self.playing:          # 暂停时立即回显编辑效果
+                await self.broadcast()
+        elif cmd == "edit_wind_zero" and self.mode == "live":
+            def _edit():
+                self.model.apply_wind_zero_edit(
+                    lat_deg=float(msg.get("lat", 0)),
+                    lon_deg=float(msg.get("lon", 0)),
+                    radius_km=float(np.clip(msg.get("radius", 800), 50, 6000)),
+                    layer=msg.get("layer", self.wind_layer_index))
+                self.fields = self.model.fields_cpu()
+            await asyncio.to_thread(_edit)
+            if not self.playing:
+                await self.broadcast()
+        elif cmd == "edit_cyclone" and self.mode == "live":
+            def _edit():
+                self.model.apply_cyclone_edit(
+                    lat_deg=float(msg.get("lat", 0)),
+                    lon_deg=float(msg.get("lon", 0)),
+                    radius_km=float(np.clip(msg.get("radius", 900), 50, 6000)),
+                    strength_ms=float(np.clip(msg.get("strength", 35), 0, 150)),
+                    layer=msg.get("layer", self.wind_layer_index))
+                self.fields = self.model.fields_cpu()
+            await asyncio.to_thread(_edit)
+            if not self.playing:
                 await self.broadcast()
 
 
@@ -369,6 +419,8 @@ def create_app(cfg, playback_dir=None):
                 "vector_strides": dict(hub.vector_strides),
                 "wind_layer_index": hub._clip_atmosphere_layer(hub.wind_layer_index),
                 "wind_layer_available": hub._has_layer_winds(hub.fields),
+                "ocean_layer_index": hub._clip_ocean_layer(hub.ocean_layer_index),
+                "ocean_layer_available": hub._has_ocean_layers(hub.fields),
                 "recording": bool(hub.recorder and hub.recorder.enabled),
                 "recorded_frames": (hub.recorder.frame_count if hub.recorder else 0)}
 

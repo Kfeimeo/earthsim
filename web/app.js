@@ -42,6 +42,8 @@ const [NLAT, NLON] = meta.shape;
 let atmosphereLevels = Array.isArray(meta.atmosphere_levels_m) ? meta.atmosphere_levels_m : [];
 let windLayerAvailable = meta.wind_layer_available !== false;
 let pendingWindLayer = null;
+let oceanLayerAvailable = meta.ocean_layer_available === true;
+let pendingOceanLayer = null;
 document.getElementById("badge-mode").textContent = meta.mode === "live" ? "实时模拟" : "预演算回放";
 document.getElementById("badge-backend").textContent = "后端 " + meta.backend.toUpperCase();
 
@@ -181,7 +183,7 @@ const flowScale = {
 const initialStrides = meta.vector_strides || { wind: meta.vector_stride || 5, ocean: meta.vector_stride || 5 };
 const flowState = {
   wind: { enabled: false, mode: "vector", stride: initialStrides.wind || 5, layer: meta.wind_layer_index || 0 },
-  ocean: { enabled: false, mode: "vector", stride: initialStrides.ocean || 5 },
+  ocean: { enabled: false, mode: "vector", stride: initialStrides.ocean || 5, layer: meta.ocean_layer_index || 0 },
 };
 
 function lonLatToPos(latDeg, lonDeg, r) {
@@ -300,20 +302,29 @@ function applyCamera() {
   camera.lookAt(0, 0, 0);
 }
 
-// ---------------- 温度编辑(笔刷) ----------------
+// ---------------- 区域编辑(笔刷) ----------------
 let editMode = false, painting = false, lastPaint = 0;
 const brush = new THREE.Mesh(new THREE.RingGeometry(0.92, 1, 48),
   new THREE.MeshBasicMaterial({ color: 0xff7043, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthWrite: false }));
 brush.visible = false; scene.add(brush);
 
+const editKind = () => document.getElementById("edit-kind").value;
 const editDelta = () => parseFloat(document.getElementById("edit-delta").value);
 const editRadius = () => parseFloat(document.getElementById("edit-radius").value);
+const cycloneStrength = () => parseFloat(document.getElementById("cyclone-strength").value);
 
 function updateEditLabels() {
+  const kind = editKind();
   const d = editDelta();
   document.getElementById("edit-delta-label").textContent = (d > 0 ? "+" : "") + d + "°C";
   document.getElementById("edit-radius-label").textContent = editRadius() + "km";
-  brush.material.color.set(d >= 0 ? 0xff7043 : 0x53a8ff);
+  document.getElementById("cyclone-strength-label").textContent = cycloneStrength() + "m/s";
+  document.getElementById("edit-delta").closest(".edit-row").classList.toggle("hidden", kind !== "temp");
+  document.getElementById("edit-target").closest(".edit-row").classList.toggle("hidden", kind !== "temp");
+  document.getElementById("cyclone-strength-row").classList.toggle("hidden", kind !== "cyclone");
+  if (kind === "wind_zero") brush.material.color.set(0x53a8ff);
+  else if (kind === "cyclone") brush.material.color.set(0xf5b14c);
+  else brush.material.color.set(d >= 0 ? 0xff7043 : 0x53a8ff);
 }
 if (meta.mode === "live") {
   document.getElementById("edit-panel").classList.remove("hidden");
@@ -324,11 +335,13 @@ if (meta.mode === "live") {
     canvas.classList.toggle("editing", editMode);
     brush.visible = false; painting = false;
     document.getElementById("hint").textContent = editMode
-      ? "点击/按住拖动 = 涂抹温度 · 滚轮缩放 · 退出编辑后可旋转"
+      ? "点击/按住拖动 = 区域编辑 · 滚轮缩放 · 退出编辑后可旋转"
       : "拖动旋转 · 滚轮缩放 · 点击地表查看天气";
   };
+  document.getElementById("edit-kind").onchange = updateEditLabels;
   document.getElementById("edit-delta").oninput = updateEditLabels;
   document.getElementById("edit-radius").oninput = updateEditLabels;
+  document.getElementById("cyclone-strength").oninput = updateEditLabels;
   updateEditLabels();
 }
 function hitGlobe(e) {
@@ -352,8 +365,16 @@ function paintAt(n) {
   lastPaint = now;
   const lat = Math.asin(n.y) * 180 / Math.PI;
   const lon = ((Math.atan2(n.x, n.z) / (2 * Math.PI) + 0.5) * 360) % 360;
-  send({ cmd: "edit_temp", lat, lon, radius: editRadius(),
-         delta: editDelta(), target: document.getElementById("edit-target").value });
+  const kind = editKind();
+  if (kind === "wind_zero") {
+    send({ cmd: "edit_wind_zero", lat, lon, radius: editRadius(), layer: flowState.wind.layer });
+  } else if (kind === "cyclone") {
+    send({ cmd: "edit_cyclone", lat, lon, radius: editRadius(),
+           strength: cycloneStrength(), layer: flowState.wind.layer });
+  } else {
+    send({ cmd: "edit_temp", lat, lon, radius: editRadius(),
+           delta: editDelta(), target: document.getElementById("edit-target").value });
+  }
 }
 
 canvas.addEventListener("pointerdown", e => {
@@ -477,9 +498,18 @@ function windLayerCount() {
 function clampWindLayer(k) {
   return Math.max(0, Math.min(windLayerCount() - 1, parseInt(k || 0)));
 }
+function oceanLayerCount() {
+  return oceanLayerAvailable ? 2 : 1;
+}
+function clampOceanLayer(k) {
+  return Math.max(0, Math.min(oceanLayerCount() - 1, parseInt(k || 0)));
+}
 function formatWindLayerLabel(k) {
   const z = atmosphereLevels[k];
   return Number.isFinite(z) ? `${Math.round(z)} m` : `第 ${k + 1} 层`;
+}
+function formatOceanLayerLabel(k) {
+  return k === 1 ? "深层" : "表层";
 }
 function sameAtmosphereLevels(next) {
   if (!Array.isArray(next) || next.length !== atmosphereLevels.length) return false;
@@ -501,6 +531,23 @@ function setupWindLayerControl() {
   flowState.wind.layer = clampWindLayer(flowState.wind.layer);
   if (pendingWindLayer !== null) pendingWindLayer = clampWindLayer(pendingWindLayer);
   layer.value = String(flowState.wind.layer);
+}
+function setupOceanLayerControl() {
+  const row = document.getElementById("ocean-layer-row");
+  const layer = document.getElementById("ocean-layer");
+  const count = oceanLayerCount();
+  layer.innerHTML = "";
+  for (let k = 0; k < count; k++) {
+    const opt = document.createElement("option");
+    opt.value = String(k);
+    opt.textContent = formatOceanLayerLabel(k);
+    layer.appendChild(opt);
+  }
+  row.classList.toggle("hidden", count <= 1 || !oceanLayerAvailable);
+  layer.disabled = !oceanLayerAvailable;
+  flowState.ocean.layer = clampOceanLayer(flowState.ocean.layer);
+  if (pendingOceanLayer !== null) pendingOceanLayer = clampOceanLayer(pendingOceanLayer);
+  layer.value = String(flowState.ocean.layer);
 }
 function syncWindLayerMeta(m) {
   let controlsChanged = false;
@@ -527,6 +574,25 @@ function syncWindLayerSelection(m) {
   if (layer) layer.value = String(serverLayer);
   return true;
 }
+function syncOceanLayerMeta(m) {
+  if (typeof m.ocean_layer_available === "boolean" && oceanLayerAvailable !== m.ocean_layer_available) {
+    oceanLayerAvailable = m.ocean_layer_available;
+    if (!oceanLayerAvailable) pendingOceanLayer = null;
+    setupOceanLayerControl();
+  }
+}
+function syncOceanLayerSelection(m) {
+  if (!Number.isInteger(m.ocean_layer_index)) return true;
+  const serverLayer = clampOceanLayer(m.ocean_layer_index);
+  const waitingForSelection = pendingOceanLayer !== null;
+  if (waitingForSelection && serverLayer !== pendingOceanLayer) return false;
+
+  pendingOceanLayer = null;
+  flowState.ocean.layer = serverLayer;
+  const layer = document.getElementById("ocean-layer");
+  if (layer) layer.value = String(serverLayer);
+  return true;
+}
 function setupFlowControls(name) {
   const tg = document.getElementById("tg-" + name);
   const mode = document.getElementById(name + "-mode");
@@ -550,11 +616,12 @@ function setupFlowControls(name) {
   };
   if (layer) {
     layer.onchange = e => {
-      state.layer = clampWindLayer(e.target.value);
-      pendingWindLayer = state.layer;
+      state.layer = name === "wind" ? clampWindLayer(e.target.value) : clampOceanLayer(e.target.value);
+      if (name === "wind") pendingWindLayer = state.layer;
+      else pendingOceanLayer = state.layer;
       layer.value = String(state.layer);
-      clearLines(flowLines.wind);
-      send({ cmd: "set_wind_layer", value: state.layer });
+      clearLines(flowLines[name]);
+      send({ cmd: name === "wind" ? "set_wind_layer" : "set_ocean_layer", value: state.layer });
     };
   }
   density.oninput = () => {
@@ -568,8 +635,10 @@ function syncFlowSettings() {
     send({ cmd: "set_vector_stride", target: name, value: state.stride });
   }
   send({ cmd: "set_wind_layer", value: flowState.wind.layer });
+  send({ cmd: "set_ocean_layer", value: flowState.ocean.layer });
 }
 setupWindLayerControl();
+setupOceanLayerControl();
 setupFlowControls("wind");
 setupFlowControls("ocean");
 
@@ -612,12 +681,14 @@ ws.onmessage = ev => {
   m.vecf = {};
   for (const V of m.vecs) m.vecf[V.name] = { data: new Float32Array(ev.data.slice(base + V.off, base + V.off + V.len)), shape: V.shape, stride: V.stride };
   syncWindLayerMeta(m);
+  syncOceanLayerMeta(m);
   const windLayerMatchesSelection = syncWindLayerSelection(m);
+  const oceanLayerMatchesSelection = syncOceanLayerSelection(m);
   lastFrame = m;
-  render(m, windLayerMatchesSelection);
+  render(m, windLayerMatchesSelection, oceanLayerMatchesSelection);
 };
 
-function render(m, windLayerMatchesSelection = true) {
+function render(m, windLayerMatchesSelection = true, oceanLayerMatchesSelection = true) {
   cloudTex.image.data.set(m.bytes.cloud); cloudTex.needsUpdate = true;
   iceTex.image.data.set(m.bytes.ice); iceTex.needsUpdate = true;
   if (LAYERS[activeLayer].cm) {
@@ -625,7 +696,7 @@ function render(m, windLayerMatchesSelection = true) {
     drawLegend(LAYERS[activeLayer], m.layers.find(l => l.name === activeLayer));
   }
   if (windLayerMatchesSelection) updateFlow("wind", m);
-  updateFlow("ocean", m);
+  if (oceanLayerMatchesSelection) updateFlow("ocean", m);
   refreshSelectedAnalysis();
   // 太阳方向
   const [sla, slo] = m.subsolar;

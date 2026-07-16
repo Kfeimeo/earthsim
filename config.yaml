@@ -199,7 +199,7 @@ physics:
 
   vertical:
     enabled: true
-    levels_m: [100, 1000, 2000, 3000, 6000, 10000]
+    levels_m: [100, 300, 500, 1000, 3000, 8000]
     lapse_rate: 0.0065
     scale_height: 8000.0
     scale_height_min_m: 1000.0
@@ -232,11 +232,12 @@ physics:
   edit:
     min_radius_km: 50.0
     air_humidity_max: 0.04
+    cyclone_max_wind_ms: 120.0
 
 numerics:
   advection: upwind
-  cos_clamp: 0.2
-  polar_filter_lat: 88.0
+  cos_clamp: 0.1
+  polar_filter_lat: 85.0
   polar_filter_passes: 6
 
 precompute:
