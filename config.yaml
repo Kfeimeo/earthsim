@@ -6,32 +6,34 @@
 backend: cuda            # auto | cuda | cpu
 
 grid:
-  nlat: 360              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
-  nlon: 720              # usually nlat*2
+  nlat: 1800              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
+  nlon: 3600             # usually nlat*2
   topo_file: data/etopo2022_60s.npz
   topo_files:
     - data/etopo2022_60s.npz
     - data/etopo20.npz
 
 time:
-  dt: 60
+  dt: 30
   start: "2026-05-01T00:00:00"
   spinup_days: 0
 
 data:
-  init_mode: ideal       # ideal | auto | real
+  init_mode: real       # ideal | auto | real
   atmosphere_file: data/era5_pressure_levels.nc
   surface_file: data/era5_single_levels.nc
   ocean_file: data/cmems_surface_currents.nc
   init_time: ""          # empty means time.start
 
 physics:
+  # Feature switches
   moisture: true
   radiation: true
   ocean: true
   ice_albedo: true
   diurnal_cycle: true
 
+  # Core dynamics
   H0: 8000.0
   g_eff: 9.8
   beta_T: 22.0
@@ -39,11 +41,12 @@ physics:
   drag: 6.0e-6
   drag_ocean_atmosphere: 4.0e-6
   drag_land_atmosphere: 1.2e-5
-  visc: 8.0e+4
-  diff_T: 4.0e+4
-  diff_q: 2.0e+4
+  visc: 4.0e+4
+  diff_T: 2.0e+4
+  diff_q: 1.0e+4
   umax: 150
 
+  # Shortwave and surface albedo
   S0: 1361.0
   alb_ocean: 0.07
   alb_land: 0.22
@@ -52,86 +55,10 @@ physics:
   alb_cloud: 0.42
   tau_relax_T: 864000.0
 
-  initial_conditions:
-    equilibrium_temp_base_k: 308.0
-    equilibrium_temp_pole_delta_k: 42.0
-    surface_lapse_rate: 0.0065
-    humidity_decay_height_m: 4500.0
-    temp_wave_lon1: 3.0
-    temp_wave_phase1: 0.7
-    temp_wave_weight2: 0.5
-    temp_wave_lon2: 5.0
-    temp_wave_phase2: -1.3
-    temp_wave_decay_height_m: 7000.0
-    real_default_temp_k: 280.0
-    real_default_humidity: 0.01
-    real_default_mslp_hpa: 1013.0
-
-  bounds:
-    air_temp_min_k: 160.0
-    air_temp_max_k: 345.0
-    surface_temp_min_k: 170.0
-    surface_temp_max_k: 350.0
-    ocean_initial_min_temp_k: 271.2
-    ocean_freezing_min_temp_k: 268.0
-    sea_ice_threshold_k: 271.4
-    sea_ice_transition_k: 2.0
-    snow_threshold_k: 273.5
-    snow_transition_k: 6.0
-    humidity_min: 0.0
-    humidity_max: 0.05
-    cloud_min: 0.0
-    cloud_max: 1.0
-    precip_max_mmh: 1.2
-    ocean_current_max_ms: 2.0
-    relative_humidity_max: 1.3
-
-  radiation_transfer:
-    albedo_max: 0.85
-    surface_sw_fraction: 0.80
-    cloud_sw_absorption: 0.30
-    air_sw_fraction: 0.18
-    surface_emissivity: 0.98
-    down_emissivity_base: 0.60
-    down_emissivity_humidity: 0.25
-    down_emissivity_cloud: 0.15
-    down_emissivity_max: 0.98
-    olr_factor_base: 0.62
-    olr_factor_humidity: 0.20
-    olr_factor_cloud: 0.08
-    olr_factor_min: 0.28
-    olr_factor_max: 0.62
-    air_longwave_coupling: 0.85
-    seasonal_temp_base_k: 302.0
-    seasonal_temp_pole_delta_k: 42.0
-    seasonal_temp_amp_k: 8.0
-
-  surface_flux:
-    wind_speed_floor_ms: 1.0
-    sensible_heat_coeff: 1.2e-3
-    humidity_greenhouse_scale: 0.02
-
-  moisture_transport:
-    subsidence_drying_coeff: 0.7
-    subsidence_divergence_max: 1.0e-4
-    precip_cloud_diagnostic_scale_mmh: 2.0
-    cloud_subsidence_scale: 1.5e5
-    cloud_subsidence_clear_max: 2.0
-    cloud_subsidence_cover_max: 0.45
-    relative_humidity_min: 0.0
-    effective_rh_max: 1.2
-
-  pressure:
-    mslp_reference_hpa: 1013.0
-    thickness_per_hpa: 22.22222222222222
-    hpa_per_thickness_m: 0.045
-    thickness_min_factor: 0.4
-    thickness_max_factor: 1.8
-    thickness_diffusion_factor: 0.5
-
-  rh_crit: 0.90
-  tau_cond: 5400.0
-  c_evap: 9.0e-4
+  # Moist convection, clouds, and land water
+  rh_crit: 0.85
+  tau_cond: 3600.0
+  c_evap: 1.2e-3
   convective_rh_drop_max: 0.12
   convective_div_scale: 3.0e-5
   cloud_rh_start: 0.70
@@ -155,6 +82,7 @@ physics:
   ground_runoff_tau: 864000.0
   ground_runoff_exponent: 2.0
 
+  # Idealized wind initialization
   ideal_wind_enabled: true
   ideal_trade_wind_ms: 5.0
   ideal_surface_westerly_ms: 4.0
@@ -179,6 +107,84 @@ physics:
     wave_wavenumber: 4.0
     wave_phase: 0.8
 
+  initial_conditions:
+    equilibrium_temp_base_k: 288.0
+    equilibrium_temp_pole_delta_k: 42.0
+    surface_lapse_rate: 0.0065
+    humidity_decay_height_m: 4500.0
+    temp_wave_lon1: 3.0
+    temp_wave_phase1: 0.7
+    temp_wave_weight2: 0.5
+    temp_wave_lon2: 5.0
+    temp_wave_phase2: -1.3
+    temp_wave_decay_height_m: 7000.0
+    real_default_temp_k: 280.0
+    real_default_humidity: 0.01
+    real_default_mslp_hpa: 1013.0
+
+  bounds:
+    air_temp_min_k: 180.0
+    air_temp_max_k: 345.0
+    surface_temp_min_k: 180.0
+    surface_temp_max_k: 350.0
+    ocean_initial_min_temp_k: 271.2
+    ocean_freezing_min_temp_k: 271.2
+    sea_ice_threshold_k: 271.4
+    sea_ice_transition_k: 2.0
+    snow_threshold_k: 273.5
+    snow_transition_k: 6.0
+    humidity_min: 0.0
+    humidity_max: 0.05
+    cloud_min: 0.0
+    cloud_max: 1.0
+    precip_max_mmh: 5.0
+    ocean_current_max_ms: 2.0
+    relative_humidity_max: 1.3
+
+  radiation_transfer:
+    albedo_max: 0.85
+    surface_sw_fraction: 0.80
+    cloud_sw_absorption: 0.30
+    air_sw_fraction: 0.18
+    surface_emissivity: 0.98
+    down_emissivity_base: 0.60
+    down_emissivity_humidity: 0.25
+    down_emissivity_cloud: 0.15
+    down_emissivity_max: 0.98
+    olr_factor_base: 0.62
+    olr_factor_humidity: 0.20
+    olr_factor_cloud: 0.08
+    olr_factor_min: 0.28
+    olr_factor_max: 0.62
+    air_longwave_coupling: 0.85
+    seasonal_temp_base_k: 288.0
+    seasonal_temp_pole_delta_k: 42.0
+    seasonal_temp_amp_k: 8.0
+
+  surface_flux:
+    wind_speed_floor_ms: 1.0
+    sensible_heat_coeff: 1.2e-3
+    humidity_greenhouse_scale: 0.02
+
+  moisture_transport:
+    subsidence_drying_coeff: 0.7
+    subsidence_divergence_max: 1.0e-4
+    precip_cloud_diagnostic_scale_mmh: 2.0
+    cloud_subsidence_scale: 1.5e5
+    cloud_subsidence_clear_max: 2.0
+    cloud_subsidence_cover_max: 0.45
+    relative_humidity_min: 0.0
+    effective_rh_max: 1.2
+
+  pressure:
+    mslp_reference_hpa: 1013.0
+    thickness_per_hpa: 8.5
+    hpa_per_thickness_m: 0.1176
+    thickness_min_factor: 0.4
+    thickness_max_factor: 1.8
+    thickness_diffusion_factor: 0.5
+
+  # Ocean mixed layer and transport
   mld: 40.0
   tau_ocean: 8.0e-7
   drag_ocean: 1.5e-6
@@ -195,11 +201,12 @@ physics:
     interlayer_heat_exchange: 1.0e-7
     deep_drag: 3.0e-7
     deep_visc: 2.0e+4
-    deep_temp_min_k: 268.0
+    deep_temp_min_k: 271.2
 
+  # Vertical atmospheric transport
   vertical:
     enabled: true
-    levels_m: [100, 300, 500, 1000, 3000, 8000]
+    levels_m: [100, 300, 500, 700,1000, 3000, 8000]
     lapse_rate: 0.0065
     scale_height: 8000.0
     scale_height_min_m: 1000.0
@@ -213,6 +220,7 @@ physics:
     diff_heat: 8.0
     diff_moisture: 5.0
 
+  # Terrain effects
   topography:
     enabled: true
     smooth_passes: 2
@@ -229,6 +237,7 @@ physics:
     slope_min: 1.0e-6
     turn_speed_threshold: 0.1
 
+  # Interactive editing limits
   edit:
     min_radius_km: 50.0
     air_humidity_max: 0.04
@@ -248,7 +257,7 @@ precompute:
 server:
   host: 0.0.0.0
   port: 8000
-  steps_per_frame: 5
+  steps_per_frame: 10
   max_fps: 60
   vector_stride: 5
   basemap_width: 2160

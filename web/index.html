@@ -43,6 +43,9 @@
       <option value="vector">矢量图</option>
       <option value="streamline">流线图</option>
     </select>
+    <div class="flow-layer" id="ocean-layer-row">
+      <span>层次</span><select id="ocean-layer"></select>
+    </div>
     <div class="flow-density">
       <span>密度</span><input type="range" id="ocean-density" min="1" max="10" step="1"><span class="mono" id="ocean-density-label"></span>
     </div>
@@ -53,9 +56,17 @@
     <div class="legend-labels mono"><span id="legend-min"></span><span id="legend-name"></span><span id="legend-max"></span></div>
   </div>
   <div id="edit-panel" class="live-only hidden">
-    <div class="panel-title" style="margin-top:14px">温度编辑</div>
+    <div class="panel-title" style="margin-top:14px">区域编辑</div>
     <button id="btn-edit" class="layer-btn">🖌 进入编辑模式</button>
+    <div class="edit-row"><span>类型</span>
+      <select id="edit-kind">
+        <option value="temp">温度调整</option>
+        <option value="wind_zero">风速清零</option>
+        <option value="cyclone">有旋飓风</option>
+      </select>
+    </div>
     <div class="edit-row"><span>幅度</span><input type="range" id="edit-delta" min="-100" max="20" step="1" value="8"><span class="mono" id="edit-delta-label">+8°C</span></div>
+    <div class="edit-row" id="cyclone-strength-row"><span>强度</span><input type="range" id="cyclone-strength" min="5" max="100" step="5" value="35"><span class="mono" id="cyclone-strength-label">35m/s</span></div>
     <div class="edit-row"><span>半径</span><input type="range" id="edit-radius" min="200" max="4000" step="100" value="1000"><span class="mono" id="edit-radius-label">1000km</span></div>
     <div class="edit-row"><span>作用</span>
       <select id="edit-target">

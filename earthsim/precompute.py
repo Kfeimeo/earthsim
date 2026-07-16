@@ -6,9 +6,16 @@
 import json
 import os
 import time
+
 import numpy as np
 
 from .model import EarthModel
+
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - only used when tqdm is not installed
+    tqdm = None
 
 
 def run_precompute(cfg, days=None, progress=True):
@@ -25,26 +32,52 @@ def run_precompute(cfg, days=None, progress=True):
 
     manifest = {
         "grid": {"nlat": model.nlat, "nlon": model.nlon},
-        "dt": model.dt, "save_every_steps": save_every,
+        "dt": model.dt,
+        "save_every_steps": save_every,
         "backend": model.backend,
         "atmosphere_levels_m": model.levels_m.tolist(),
         "times": [],
     }
+
     t0 = time.time()
-    for k in range(nframes):
+    frame_iter = range(nframes)
+    progress_bar = None
+    if progress and tqdm is not None:
+        progress_bar = tqdm(
+            frame_iter,
+            total=nframes,
+            desc="[precompute] 预演算",
+            unit="frame",
+            dynamic_ncols=True,
+        )
+        frame_iter = progress_bar
+
+    for k in frame_iter:
         model.step(save_every)
         f = model.fields_cpu(include_layers=True)
         np.savez_compressed(
             os.path.join(frames_dir, f"frame_{k:06d}.npz"),
             **{key: v.astype(np.float32) for key, v in f.items()},
-            subsolar=np.array(model.subsolar, np.float32))
+            subsolar=np.array(model.subsolar, np.float32),
+        )
         manifest["times"].append(model.t.isoformat())
-        if progress and (k % 10 == 0 or k == nframes - 1):
+
+        if progress_bar is not None:
+            progress_bar.set_postfix_str(
+                f"模拟时刻={model.t.isoformat(timespec='seconds')}"
+            )
+        elif progress and (k % 10 == 0 or k == nframes - 1):
             el = time.time() - t0
-            print(f"[precompute] 帧 {k+1}/{nframes}  模拟时刻 {model.t}  "
-                  f"耗时 {el:.1f}s", flush=True)
-    with open(os.path.join(out_dir, "manifest.json"), "w",
-              encoding="utf-8") as fp:
+            print(
+                f"[precompute] 帧 {k + 1}/{nframes}  "
+                f"模拟时刻 {model.t}  耗时 {el:.1f}s",
+                flush=True,
+            )
+
+    if progress_bar is not None:
+        progress_bar.close()
+
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fp:
         json.dump(manifest, fp, ensure_ascii=False, indent=1)
     print(f"[precompute] 完成: {nframes} 帧 -> {out_dir}")
     return out_dir
@@ -55,8 +88,7 @@ class FramePlayer:
 
     def __init__(self, run_dir):
         self.dir = run_dir
-        with open(os.path.join(run_dir, "manifest.json"),
-                  encoding="utf-8") as fp:
+        with open(os.path.join(run_dir, "manifest.json"), encoding="utf-8") as fp:
             self.manifest = json.load(fp)
         self.n = len(self.manifest["times"])
         self._cache, self._order = {}, []
