@@ -95,6 +95,11 @@ class Ops:
         if self.cuda_adv is not None:
             return self.cuda_adv.adv_diff(F, u, v, self.invdx_flat,
                                           float(self.invdy), float(K), float(dt))
+        if F.ndim > 2:
+            return self.xp.stack([
+                self.adv_diff_step(Fk, uk, vk, K, dt)
+                for Fk, uk, vk in zip(F, u, v)
+            ], axis=0)
         return F + dt * (self.upwind_adv(F, u, v) + K * self.lap(F))
 
     def polar_filter(self, F):

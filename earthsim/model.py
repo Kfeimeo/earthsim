@@ -864,9 +864,12 @@ class EarthModel:
                     * _np.sin(_np.radians(self.subsolar[0]) * 2))
         lowest_mass = max(float(self.layer_mass_fractions[0]),
                           float(p.vertical.lowest_layer_mass_min))
+        Ta_adv = o.adv_diff_step(Ta, u, v, p.diff_T, dt)
+        q_adv = (o.adv_diff_step(q, u, v, p.diff_q, dt)
+                 if p.moisture else q)
         Ta_out, q_out, div_out = [], [], []
         for k in range(self.nz):
-            Tk = o.adv_diff_step(Ta[k], u[k], v[k], p.diff_T, dt)
+            Tk = Ta_adv[k]
             if k == 0:
                 Tk += dt * (SH + SW_air + float(rt.air_longwave_coupling)
                             * (LW_up - LW_dn)
@@ -880,7 +883,7 @@ class EarthModel:
                                  float(self.cfg.numerics.cos_clamp)))
             div_out.append(divk)
             if p.moisture:
-                qk = o.adv_diff_step(q[k], u[k], v[k], p.diff_q, dt)
+                qk = q_adv[k]
                 if k == 0:
                     qk += dt * E / (MCOL * lowest_mass)
             else:
@@ -908,17 +911,20 @@ class EarthModel:
             self.cloud = self._update_cloud_cover(cl, rh, div)
 
         # Layer pressure-gradient flow plus terrain drag/blocking/deflection.
+        h_adv = o.adv_diff_step(
+            h, u, v,
+            p.visc * float(pressure.thickness_diffusion_factor), dt)
+        u_adv = o.adv_diff_step(u, u, v, p.visc, dt)
+        v_adv = o.adv_diff_step(v, u, v, p.visc, dt)
         h_out, u_out, v_out = [], [], []
         for k in range(self.nz):
             h_eq = p.H0 - p.beta_T * (Ta[k] - Ta[k].mean())
-            hk = o.adv_diff_step(
-                h[k], u[k], v[k],
-                p.visc * float(pressure.thickness_diffusion_factor), dt)
+            hk = h_adv[k]
             hk += dt * (-hk * div[k] + (h_eq - hk) / p.tau_h)
             hk = xp.clip(hk, float(pressure.thickness_min_factor) * p.H0,
                          float(pressure.thickness_max_factor) * p.H0)
-            uk = o.adv_diff_step(u[k], u[k], v[k], p.visc, dt)
-            vk = o.adv_diff_step(v[k], u[k], v[k], p.visc, dt)
+            uk = u_adv[k]
+            vk = v_adv[k]
             terrain_u, terrain_v = self._terrain_acceleration(uk, vk, k)
             uk += dt * (-p.g_eff * o.ddx(hk) + terrain_u + o.tanl * uk * vk)
             vk += dt * (-p.g_eff * o.ddy(hk) + terrain_v - o.tanl * uk * uk)

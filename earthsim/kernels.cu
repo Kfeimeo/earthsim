@@ -5,8 +5,8 @@
 // ============================================================
 extern "C" {
 
-#define ADV_BLOCK_X 32
-#define ADV_BLOCK_Y 32
+#define ADV_BLOCK_X 16
+#define ADV_BLOCK_Y 16
 
 __device__ __forceinline__ int wrap(int j, int n) {
     return (j + n) % n;
@@ -17,13 +17,13 @@ __device__ __forceinline__ int clampi(int i, int n) {
 }
 
 __device__ __forceinline__ float load_clamped_wrapped(
-    const float* __restrict__ F, int i, int j, int nlat, int nlon)
+    const float* __restrict__ F, int base, int i, int j, int nlat, int nlon)
 {
-    return F[clampi(i, nlat) * nlon + wrap(j, nlon)];
+    return F[base + clampi(i, nlat) * nlon + wrap(j, nlon)];
 }
 
 // F += dt * (-u dF/dx - v dF/dy + K * lap(F)).
-// The Python wrapper launches 16x16 blocks, so the shared tile is 18x18.
+// The Python wrapper launches one 16x16 grid per leading-dimension plane.
 __global__ void adv_diff(
     const float* __restrict__ F,
     const float* __restrict__ u,
@@ -39,29 +39,32 @@ __global__ void adv_diff(
     int ty = threadIdx.y;
     int j = blockIdx.x * blockDim.x + tx;  // lon
     int i = blockIdx.y * blockDim.y + ty;  // lat
+    int base = blockIdx.z * nlat * nlon;
     int sj = tx + 1;
     int si = ty + 1;
 
-    tile[si][sj] = load_clamped_wrapped(F, i, j, nlat, nlon);
+    tile[si][sj] = load_clamped_wrapped(F, base, i, j, nlat, nlon);
 
     if (tx == 0) {
-        tile[si][0] = load_clamped_wrapped(F, i, j - 1, nlat, nlon);
+        tile[si][0] = load_clamped_wrapped(F, base, i, j - 1, nlat, nlon);
     }
     if (tx == blockDim.x - 1) {
-        tile[si][sj + 1] = load_clamped_wrapped(F, i, j + 1, nlat, nlon);
+        tile[si][sj + 1] = load_clamped_wrapped(F, base, i, j + 1,
+                                                nlat, nlon);
     }
     if (ty == 0) {
-        tile[0][sj] = load_clamped_wrapped(F, i - 1, j, nlat, nlon);
+        tile[0][sj] = load_clamped_wrapped(F, base, i - 1, j, nlat, nlon);
     }
     if (ty == blockDim.y - 1) {
-        tile[si + 1][sj] = load_clamped_wrapped(F, i + 1, j, nlat, nlon);
+        tile[si + 1][sj] = load_clamped_wrapped(F, base, i + 1, j,
+                                                nlat, nlon);
     }
 
     __syncthreads();
 
     if (i >= nlat || j >= nlon) return;
 
-    int idx = i * nlon + j;
+    int idx = base + i * nlon + j;
     float f  = tile[si][sj];
     float fw = tile[si][sj - 1], fe = tile[si][sj + 1];
     float fs = tile[si - 1][sj], fn = tile[si + 1][sj];

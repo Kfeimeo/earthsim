@@ -27,13 +27,28 @@ def load():
 
 
 def adv_diff(F, u, v, invdx, invdy, K, dt):
-    """返回 F + dt*(-adv + K*lap)。F/u/v 为 float32 cupy 数组 (nlat,nlon)。"""
+    """返回批量平流扩散结果；末两维为 (nlat, nlon)。"""
     import cupy as cp
-    nlat, nlon = F.shape
+    if F.ndim < 2:
+        raise ValueError("advection field must have at least two dimensions")
+    if F.shape != u.shape or F.shape != v.shape:
+        raise ValueError("F, u, and v must have identical shapes")
+    if F.dtype != cp.float32 or u.dtype != cp.float32 or v.dtype != cp.float32:
+        raise TypeError("advection CUDA kernel requires float32 inputs")
+
+    F = cp.ascontiguousarray(F)
+    u = cp.ascontiguousarray(u)
+    v = cp.ascontiguousarray(v)
+    invdx = cp.ascontiguousarray(invdx, dtype=cp.float32)
+    nlat, nlon = F.shape[-2:]
+    if invdx.size != nlat:
+        raise ValueError("invdx length must match the latitude dimension")
+    planes = F.size // (nlat * nlon)
     out = cp.empty_like(F)
     block = _ADV_BLOCK
     grid = ((nlon + block[0] - 1) // block[0],
-            (nlat + block[1] - 1) // block[1])
+            (nlat + block[1] - 1) // block[1],
+            planes)
     _adv_diff(grid, block,
               (F, u, v, invdx, cp.float32(invdy), cp.float32(K),
                cp.float32(dt), out, cp.int32(nlat), cp.int32(nlon)))
