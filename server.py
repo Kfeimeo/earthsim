@@ -12,11 +12,11 @@ import struct
 
 import numpy as np
 
-from earthsim.analysis import analyze_point
-from earthsim.backend import to_cpu
-from earthsim.model import EarthModel
-from earthsim.precompute import FramePlayer
-from earthsim import topo as _topo
+from sim.analysis import analyze_point
+from sim.backend import to_cpu
+from sim.model import EarthModel
+from sim.precompute import FramePlayer
+from sim import topo as _topo
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 

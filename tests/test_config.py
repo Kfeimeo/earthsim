@@ -1,4 +1,4 @@
-from earthsim.config import load_config
+from sim.config import load_config
 
 
 def test_blank_values_keep_defaults(tmp_path):

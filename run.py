@@ -19,15 +19,15 @@ def main():
     ap.add_argument("--port", type=int, default=None)
     args = ap.parse_args()
 
-    from earthsim.config import load_config
+    from sim.config import load_config
     cfg = load_config(args.config)
 
     if args.command == "precompute":
-        from earthsim.precompute import run_precompute
+        from sim.precompute import run_precompute
         run_precompute(cfg, days=args.days)
 
     elif args.command == "benchmark":
-        from earthsim.model import EarthModel
+        from sim.model import EarthModel
         m = EarthModel(cfg)
         print(f"后端: {m.backend}  网格: {m.nlat}x{m.nlon}  dt={m.dt}s")
         m.step(5)  # 预热

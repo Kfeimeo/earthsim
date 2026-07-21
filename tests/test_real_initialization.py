@@ -4,9 +4,9 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-from earthsim.config import load_config
-from earthsim.data_loader import _profile
-from earthsim.model import EarthModel
+from sim.config import load_config
+from sim.data_loader import _profile
+from sim.model import EarthModel
 
 
 def test_profile_copies_read_only_pressure_levels():

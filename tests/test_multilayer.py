@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from earthsim.config import load_config
-from earthsim.model import EarthModel
+from sim.config import load_config
+from sim.model import EarthModel
 
 
 def small_config():

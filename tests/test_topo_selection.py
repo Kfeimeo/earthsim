@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-from earthsim import topo
+from sim import topo
 
 
 def _write_npz(path: Path, shape, value):
