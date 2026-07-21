@@ -31,15 +31,22 @@ class Ops:
     """给定网格的球面差分算子集合(预计算度量项)。"""
 
     def __init__(self, xp, lats_deg, nlon, cos_clamp=0.2,
-                 pf_lat=65.0, pf_passes=6, use_cuda_kernel=False):
+                 pf_lat=65.0, pf_passes=6, use_cuda_kernel=False,
+                 lons_deg=None):
         self.xp = xp
         nlat = len(lats_deg)
         self.nlat, self.nlon = nlat, nlon
         lat = xp.asarray(_np.radians(lats_deg), dtype=xp.float32)[:, None]
         self.lat = lat
+        if lons_deg is None:
+            lons_deg = _np.arange(nlon, dtype=_np.float32) * (360.0 / nlon)
+        self.lon_rad = xp.asarray(
+            _np.radians(lons_deg), dtype=xp.float32)[None, :]
         dlon = 2 * _np.pi / nlon
         dlat = _np.pi / nlat
-        cosl = xp.maximum(xp.cos(lat), cos_clamp)
+        self.coslat = xp.cos(lat).astype(xp.float32)
+        cosl = xp.maximum(self.coslat, cos_clamp)
+        self.invcoslat = (1.0 / cosl).astype(xp.float32)
         self.dx = (A_EARTH * cosl * dlon).astype(xp.float32)   # [nlat,1]
         self.dy = _np.float32(A_EARTH * dlat)
         self.invdx = (1.0 / self.dx).astype(xp.float32)
@@ -58,24 +65,45 @@ class Ops:
             if cuda_kernels.load():
                 self.cuda_adv = cuda_kernels
                 self.invdx_flat = self.invdx[:, 0].copy()
+                self.coslat_flat = self.coslat[:, 0].copy()
+                self.invcoslat_flat = self.invcoslat[:, 0].copy()
                 self.pf_w_flat = self.pf_w[:, 0].copy()
 
     # ---------- 基础算子 ----------
     def rollx(self, F, k):
-        return self.xp.roll(F, k, axis=1)
+        return self.xp.roll(F, k, axis=-1)
 
     def shifty(self, F, k):
         """纬向平移, 边界复制。k=+1: 取南侧值。"""
         xp = self.xp
         if k == 1:
-            return xp.concatenate([F[:1], F[:-1]], axis=0)
-        return xp.concatenate([F[1:], F[-1:]], axis=0)
+            return xp.concatenate([F[..., :1, :], F[..., :-1, :]], axis=-2)
+        return xp.concatenate([F[..., 1:, :], F[..., -1:, :]], axis=-2)
 
     def ddx(self, F):
+        if self.cuda_adv is not None:
+            return self.cuda_adv.gradient(
+                F, self.invdx_flat, float(self.invdy))[0]
         return (self.rollx(F, -1) - self.rollx(F, 1)) * (0.5 * self.invdx)
 
     def ddy(self, F):
+        if self.cuda_adv is not None:
+            return self.cuda_adv.gradient(
+                F, self.invdx_flat, float(self.invdy))[1]
         return (self.shifty(F, -1) - self.shifty(F, 1)) * (0.5 * self.invdy)
+
+    def gradient(self, F):
+        if self.cuda_adv is not None:
+            return self.cuda_adv.gradient(
+                F, self.invdx_flat, float(self.invdy))
+        return self.ddx(F), self.ddy(F)
+
+    def divergence(self, u, v):
+        if self.cuda_adv is not None:
+            return self.cuda_adv.divergence(
+                u, v, self.invdx_flat, float(self.invdy),
+                self.coslat_flat, self.invcoslat_flat)
+        return self.ddx(u) + self.ddy(v * self.coslat) * self.invcoslat
 
     def lap(self, F):
         return ((self.rollx(F, 1) + self.rollx(F, -1) - 2 * F) * self.invdx ** 2
@@ -128,7 +156,7 @@ def qsat(xp, T):
     return 0.622 * es / P0
 
 
-def insolation(xp, lat_rad, lons_deg, t_utc, S0, diurnal=True):
+def insolation(xp, lat_rad, lon_rad, t_utc, S0, diurnal=True):
     """瞬时大气顶入射 (W/m^2) 与太阳直射点。
 
     t_utc: datetime。返回 (Q[nlat,nlon], subsolar_lat, subsolar_lon)。
@@ -137,7 +165,7 @@ def insolation(xp, lat_rad, lons_deg, t_utc, S0, diurnal=True):
     frac = (t_utc.hour + t_utc.minute / 60 + t_utc.second / 3600) / 24.0
     decl = _np.radians(23.44) * _np.sin(2 * _np.pi * (doy - 80) / 365.25)
     sub_lon = (180.0 - 360.0 * frac) % 360.0  # 正午对应太阳直射经度
-    lam = xp.asarray(_np.radians(lons_deg), dtype=xp.float32)[None, :]
+    lam = lon_rad
     if diurnal:
         hour_ang = lam - _np.radians(sub_lon)
         cosz = (xp.sin(lat_rad) * _np.sin(decl)

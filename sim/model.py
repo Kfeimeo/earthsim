@@ -26,11 +26,12 @@ class EarthModel:
         self.ops = Ops(xp, self.lats, self.nlon,
                        cos_clamp=n.cos_clamp, pf_lat=n.polar_filter_lat,
                        pf_passes=int(n.polar_filter_passes),
-                       use_cuda_kernel=(self.backend == "cuda"))
+                       use_cuda_kernel=(self.backend == "cuda"),
+                       lons_deg=self.lons)
         self.dt = float(cfg.time.dt)
         self.t = _dt.datetime.fromisoformat(str(cfg.time.start))
         self.step_count = 0
-        _, d0, l0 = insolation(self.xp, self.ops.lat, self.lons, self.t,
+        _, d0, l0 = insolation(self.xp, self.ops.lat, self.ops.lon_rad, self.t,
                                cfg.physics.S0, cfg.physics.diurnal_cycle)
         self.subsolar = (float(d0), float(l0))
         self._init_vertical_grid()
@@ -81,8 +82,9 @@ class EarthModel:
                        + neighbor * o.rollx(terrain, -1))
             terrain = (neighbor * o.shifty(terrain, 1) + center * terrain
                        + neighbor * o.shifty(terrain, -1))
-        self.terrain_slope_x = o.ddx(terrain).astype(xp.float32)
-        self.terrain_slope_y = o.ddy(terrain).astype(xp.float32)
+        slope_x, slope_y = o.gradient(terrain)
+        self.terrain_slope_x = slope_x.astype(xp.float32)
+        self.terrain_slope_y = slope_y.astype(xp.float32)
         self.terrain_slope = xp.sqrt(self.terrain_slope_x ** 2
                                      + self.terrain_slope_y ** 2).astype(xp.float32)
 
@@ -114,7 +116,7 @@ class EarthModel:
                          * qsat(xp, self.T_layers)).astype(f32)
         wave_amp = float(p.ideal_wave_amp_K)
         if wave_amp:
-            lon = xp.asarray(_np.radians(self.lons), dtype=f32)[None, :]
+            lon = self.ops.lon_rad
             wave = ((xp.sin(float(ic.temp_wave_lon1) * lon
                              + float(ic.temp_wave_phase1) * xp.sin(lat))
                      + float(ic.temp_wave_weight2)
@@ -662,7 +664,7 @@ class EarthModel:
         spd = xp.sqrt(u * u + v * v) + float(sf.wind_speed_floor_ms)
 
         # ============ 辐射 ============
-        Q_sw, decl, sub_lon = insolation(xp, o.lat, self.lons, self.t,
+        Q_sw, decl, sub_lon = insolation(xp, o.lat, o.lon_rad, self.t,
                                          p.S0, p.diurnal_cycle)
         self.subsolar = (float(decl), float(sub_lon))
         qs_a = qsat(xp, Ta)
@@ -721,8 +723,7 @@ class EarthModel:
             Ta = Ta + dt / p.tau_relax_T * (Teq - Ta)
 
         # 风场辐散 (动力学与凝结共用)
-        div = (o.ddx(u) + o.ddy(v * xp.cos(o.lat))
-               / xp.maximum(xp.cos(o.lat), float(self.cfg.numerics.cos_clamp)))
+        div = o.divergence(u, v)
 
         if p.moisture:
             q = o.adv_diff_step(q, u, v, p.diff_q, dt)
@@ -755,7 +756,7 @@ class EarthModel:
         h = xp.clip(h, float(pressure.thickness_min_factor) * p.H0,
                     float(pressure.thickness_max_factor) * p.H0)
 
-        dhdx, dhdy = o.ddx(h), o.ddy(h)
+        dhdx, dhdy = o.gradient(h)
         u = o.adv_diff_step(u, u, v, p.visc, dt)
         v = o.adv_diff_step(v, u, v, p.visc, dt)
         surface_drag = self._surface_atmospheric_drag()
@@ -815,7 +816,7 @@ class EarthModel:
         u0, v0, Ta0, q0 = u[0], v[0], Ta[0], q[0]
         spd = xp.sqrt(u0 * u0 + v0 * v0) + float(sf.wind_speed_floor_ms)
 
-        Q_sw, decl, sub_lon = insolation(xp, o.lat, self.lons, self.t,
+        Q_sw, decl, sub_lon = insolation(xp, o.lat, o.lon_rad, self.t,
                                          p.S0, p.diurnal_cycle)
         self.subsolar = (float(decl), float(sub_lon))
         gq = xp.clip(q0 / float(sf.humidity_greenhouse_scale), 0, 1)
@@ -867,7 +868,8 @@ class EarthModel:
         Ta_adv = o.adv_diff_step(Ta, u, v, p.diff_T, dt)
         q_adv = (o.adv_diff_step(q, u, v, p.diff_q, dt)
                  if p.moisture else q)
-        Ta_out, q_out, div_out = [], [], []
+        div = o.divergence(u, v)
+        Ta_out, q_out = [], []
         for k in range(self.nz):
             Tk = Ta_adv[k]
             if k == 0:
@@ -878,10 +880,6 @@ class EarthModel:
                 Teq = seasonal - float(p.vertical.lapse_rate) * self.levels_m[k]
                 Tk += dt / p.tau_relax_T * (Teq - Tk)
             Ta_out.append(Tk)
-            divk = (o.ddx(u[k]) + o.ddy(v[k] * xp.cos(o.lat))
-                    / xp.maximum(xp.cos(o.lat),
-                                 float(self.cfg.numerics.cos_clamp)))
-            div_out.append(divk)
             if p.moisture:
                 qk = q_adv[k]
                 if k == 0:
@@ -891,7 +889,6 @@ class EarthModel:
             q_out.append(qk)
         Ta = xp.stack(Ta_out, axis=0)
         q = xp.stack(q_out, axis=0)
-        div = xp.stack(div_out, axis=0)
 
         if p.moisture:
             qs_a = qsat(xp, Ta)
@@ -916,23 +913,29 @@ class EarthModel:
             p.visc * float(pressure.thickness_diffusion_factor), dt)
         u_adv = o.adv_diff_step(u, u, v, p.visc, dt)
         v_adv = o.adv_diff_step(v, u, v, p.visc, dt)
-        h_out, u_out, v_out = [], [], []
+        h_out = []
         for k in range(self.nz):
             h_eq = p.H0 - p.beta_T * (Ta[k] - Ta[k].mean())
             hk = h_adv[k]
             hk += dt * (-hk * div[k] + (h_eq - hk) / p.tau_h)
             hk = xp.clip(hk, float(pressure.thickness_min_factor) * p.H0,
                          float(pressure.thickness_max_factor) * p.H0)
+            h_out.append(hk)
+        h = xp.stack(h_out, axis=0)
+        dhdx, dhdy = o.gradient(h)
+
+        u_out, v_out = [], []
+        for k in range(self.nz):
             uk = u_adv[k]
             vk = v_adv[k]
             terrain_u, terrain_v = self._terrain_acceleration(uk, vk, k)
-            uk += dt * (-p.g_eff * o.ddx(hk) + terrain_u + o.tanl * uk * vk)
-            vk += dt * (-p.g_eff * o.ddy(hk) + terrain_v - o.tanl * uk * uk)
+            uk += dt * (-p.g_eff * dhdx[k]
+                        + terrain_u + o.tanl * uk * vk)
+            vk += dt * (-p.g_eff * dhdy[k]
+                        + terrain_v - o.tanl * uk * uk)
             uk, vk = o.coriolis_rotate(uk, vk, dt)
-            h_out.append(hk)
             u_out.append(xp.clip(uk, -p.umax, p.umax))
             v_out.append(xp.clip(vk, -p.umax, p.umax))
-        h = xp.stack(h_out, axis=0)
         u = xp.stack(u_out, axis=0)
         v = xp.stack(v_out, axis=0)
 
