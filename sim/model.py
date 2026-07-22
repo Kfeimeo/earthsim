@@ -1,42 +1,80 @@
 """EarthModel: 状态管理 + 时间积分。"""
 import datetime as _dt
 import numpy as _np
+import time as _time
 
 from . import topo as _topo
 from .backend import init_backend, to_cpu
 from .data_loader import RealDataError, load_real_initialization
 from .physics import (Ops, qsat, insolation, A_EARTH,
-                      SIGMA, CP, LV, RHO_A, MCOL, RHO_W, CW, C_LAND)
+                      SIGMA, CP, LV, RD, KAPPA, RHO_A, MCOL,
+                      RHO_W, CW, C_LAND)
+from .primitive import (validate_sigma_interfaces, hydrostatic_state,
+                        sigma_mass_flux, mass_consistent_transport,
+                        pressure_vertical_velocity)
 
 
 class EarthModel:
     def __init__(self, cfg):
+        init_started = _time.perf_counter()
         self.cfg = cfg
+        stage_started = _time.perf_counter()
         self.xp, self.backend = init_backend(cfg.backend)
+        print(f"[startup] backend initialized ({self.backend}): "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         xp = self.xp
         g = cfg.grid
         self.nlat, self.nlon = int(g.nlat), int(g.nlon)
         self.lats, self.lons = _topo.sim_grid(self.nlat, self.nlon)
         topo_spec = g.get("topo_files", g.get("topo_file", ""))
+        stage_started = _time.perf_counter()
         elev, land = _topo.load_topo(topo_spec, self.nlat, self.nlon)
+        print(f"[startup] model topography ready ({self.nlat}x{self.nlon}): "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
+        stage_started = _time.perf_counter()
         self.elev = xp.asarray(elev)
         self.land = xp.asarray(land)          # 1=陆地
         self.ocean = 1.0 - self.land
+        print(f"[startup] topography copied to {self.backend}: "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         n = cfg.numerics
+        self.advection_scheme = str(n.advection).lower()
+        if self.advection_scheme != "upwind":
+            raise ValueError(
+                "numerics.advection currently supports only 'upwind'")
+        stage_started = _time.perf_counter()
         self.ops = Ops(xp, self.lats, self.nlon,
                        cos_clamp=n.cos_clamp, pf_lat=n.polar_filter_lat,
                        pf_passes=int(n.polar_filter_passes),
                        use_cuda_kernel=(self.backend == "cuda"),
                        lons_deg=self.lons)
+        print(f"[startup] numerical operators initialized: "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         self.dt = float(cfg.time.dt)
         self.t = _dt.datetime.fromisoformat(str(cfg.time.start))
         self.step_count = 0
+        dynamics_core = str(cfg.physics.dynamics.core).lower()
+        if dynamics_core not in {"primitive_equations", "shallow_water"}:
+            raise ValueError(
+                "physics.dynamics.core must be primitive_equations or shallow_water")
+        self._primitive_enabled = dynamics_core == "primitive_equations"
         _, d0, l0 = insolation(self.xp, self.ops.lat, self.ops.lon_rad, self.t,
                                cfg.physics.S0, cfg.physics.diurnal_cycle)
         self.subsolar = (float(d0), float(l0))
+        stage_started = _time.perf_counter()
         self._init_vertical_grid()
+        print(f"[startup] vertical grid initialized ({self.nz} levels): "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
+        stage_started = _time.perf_counter()
         self._init_terrain_dynamics()
+        print(f"[startup] terrain dynamics initialized: "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
+        stage_started = _time.perf_counter()
         self._init_state()
+        print(f"[startup] model state initialized ({self.initialization_source}): "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
+        print(f"[startup] EarthModel initialization complete: "
+              f"{_time.perf_counter() - init_started:.3f}s", flush=True)
 
     # ------------------------------------------------------------
     def _init_vertical_grid(self):
@@ -70,6 +108,24 @@ class EarthModel:
         xp = self.xp
         self._z3 = xp.asarray(self.levels_m, dtype=xp.float32)[:, None, None]
         self._mass3 = xp.asarray(mass, dtype=xp.float32)[:, None, None]
+        if self._primitive_enabled:
+            sigma_values = ([1.0, 0.0] if not bool(vp.enabled)
+                            else vp.sigma_interfaces)
+            sigma = validate_sigma_interfaces(sigma_values, self.nz)
+            self.sigma_interfaces = sigma
+            self.sigma_centres = 0.5 * (sigma[:-1] + sigma[1:])
+            self.sigma_thickness = sigma[:-1] - sigma[1:]
+            self._sigma_interfaces_xp = xp.asarray(
+                self.sigma_interfaces, dtype=xp.float32)
+            self._sigma_centres_xp = xp.asarray(
+                self.sigma_centres, dtype=xp.float32)
+            self._sigma_thickness_xp = xp.asarray(
+                self.sigma_thickness, dtype=xp.float32)
+            # In a pure sigma coordinate every layer contains this fixed
+            # fraction of the prognostic column mass.
+            self.layer_mass_fractions = self.sigma_thickness.copy()
+            self._mass3 = xp.asarray(
+                self.sigma_thickness, dtype=xp.float32)[:, None, None]
 
     def _init_terrain_dynamics(self):
         """Pre-compute a smoothed terrain gradient used by the wind scheme."""
@@ -82,6 +138,11 @@ class EarthModel:
                        + neighbor * o.rollx(terrain, -1))
             terrain = (neighbor * o.shifty(terrain, 1) + center * terrain
                        + neighbor * o.shifty(terrain, -1))
+        if not bool(tp.enabled):
+            terrain = xp.zeros_like(terrain)
+        self.surface_height = terrain.astype(xp.float32)
+        self.surface_geopotential = (
+            float(self.cfg.physics.g_eff) * self.surface_height).astype(xp.float32)
         slope_x, slope_y = o.gradient(terrain)
         self.terrain_slope_x = slope_x.astype(xp.float32)
         self.terrain_slope_y = slope_y.astype(xp.float32)
@@ -154,9 +215,13 @@ class EarthModel:
         self.runoff = z.copy()
         self.ice, self.snow = z.copy(), z.copy()
         self.initialization_source = "idealized"
+        self._initial_mslp_hpa = xp.full_like(
+            z, float(ic.real_default_mslp_hpa))
         self._sync_surface_views()
         self._diag_surface()
         self._maybe_apply_real_initialization()
+        if self._primitive_enabled:
+            self._init_primitive_state()
         self._init_ocean_layers()
 
     def _maybe_apply_real_initialization(self):
@@ -207,6 +272,7 @@ class EarthModel:
         self.w_layers = xp.zeros_like(self.T_layers)
 
         mslp = finite(real.get("mslp_hpa"), float(ic.real_default_mslp_hpa))
+        self._initial_mslp_hpa = xp.asarray(mslp, dtype=xp.float32)
         h_base = (float(p.H0)
                   + (mslp - float(pressure.mslp_reference_hpa))
                   * float(pressure.thickness_per_hpa))
@@ -248,6 +314,126 @@ class EarthModel:
         self.initialization_source = "real"
         self._sync_surface_views()
         self._diag_surface()
+
+    def _init_primitive_state(self):
+        """Initialize surface pressure and hydrostatic sigma-level geometry."""
+        xp, p = self.xp, self.cfg.physics
+        dyn, bounds = p.dynamics, p.bounds
+        psl = self._initial_mslp_hpa * 100.0
+        tv0 = self.T_layers[0] * (1.0 + 0.608 * self.q_layers[0])
+        self.surface_pressure = (
+            psl * xp.exp(-self.surface_geopotential
+                         / xp.maximum(RD * tv0, 1.0)))
+        self.surface_pressure = xp.clip(
+            self.surface_pressure,
+            float(dyn.min_surface_pressure_pa),
+            float(dyn.max_surface_pressure_pa)).astype(xp.float32)
+
+        state = hydrostatic_state(
+            xp, self.T_layers, self.q_layers, self.surface_pressure,
+            self._sigma_interfaces_xp, float(dyn.top_pressure_pa),
+            self.surface_geopotential)
+        self.pressure_interfaces_pa, self.pressure_layers_pa = state[:2]
+
+        if self.initialization_source == "idealized":
+            ic = p.initial_conditions
+            # Build the ideal atmosphere on pressure surfaces. Using the same
+            # T at the same sigma over both mountains and ocean creates a large
+            # artificial PGF because those sigma points have different p/z.
+            reference_height = -float(p.vertical.scale_height) * xp.log(
+                self.pressure_layers_pa
+                / float(dyn.reference_surface_pressure_pa))
+            reference_height = xp.maximum(reference_height, 0.0)
+            base_temperature = (
+                float(ic.equilibrium_temp_base_k)
+                - float(ic.equilibrium_temp_pole_delta_k)
+                * xp.sin(self.ops.lat) ** 2)
+            self.T_layers = self._equilibrium_temperature_profile(
+                base_temperature, reference_height)
+            wave_amp = float(p.ideal_wave_amp_K)
+            if wave_amp:
+                lon, lat = self.ops.lon_rad, self.ops.lat
+                wave = ((xp.sin(float(ic.temp_wave_lon1) * lon
+                                + float(ic.temp_wave_phase1) * xp.sin(lat))
+                         + float(ic.temp_wave_weight2)
+                         * xp.sin(float(ic.temp_wave_lon2) * lon
+                                  + float(ic.temp_wave_phase2) * xp.sin(lat)))
+                        * xp.cos(lat) ** 2)
+                self.T_layers += (
+                    wave_amp * xp.exp(
+                        -reference_height
+                        / float(ic.temp_wave_decay_height_m)) * wave)
+            self.T_layers = xp.clip(
+                self.T_layers, float(bounds.air_temp_min_k),
+                float(bounds.air_temp_max_k)).astype(xp.float32)
+
+            # Recompute terrain surface pressure with the thermodynamically
+            # consistent lowest-level temperature.
+            tv0 = self.T_layers[0] * (1.0 + 0.608 * self.q_layers[0])
+            self.surface_pressure = xp.clip(
+                psl * xp.exp(-self.surface_geopotential
+                             / xp.maximum(RD * tv0, 1.0)),
+                float(dyn.min_surface_pressure_pa),
+                float(dyn.max_surface_pressure_pa)).astype(xp.float32)
+            state = hydrostatic_state(
+                xp, self.T_layers, self.q_layers, self.surface_pressure,
+                self._sigma_interfaces_xp, float(dyn.top_pressure_pa),
+                self.surface_geopotential)
+            self.pressure_interfaces_pa, self.pressure_layers_pa = state[:2]
+
+        # Ideal humidity was originally built with a fixed 1000-hPa qsat.
+        # Reconstruct it at the actual layer pressure while preserving the
+        # intended relative-humidity profile and wave perturbation.
+        if self.initialization_source == "idealized" and p.moisture:
+            ic = p.initial_conditions
+            rh_profile = (float(p.init_upper_rh)
+                          + (float(p.init_surface_rh)
+                             - float(p.init_upper_rh))
+                          * _np.exp(-self.levels_m
+                                    / float(ic.humidity_decay_height_m)))
+            rh = xp.asarray(rh_profile, dtype=xp.float32)[:, None, None]
+            if float(p.ideal_humidity_wave):
+                lon, lat = self.ops.lon_rad, self.ops.lat
+                wave = ((xp.sin(float(ic.temp_wave_lon1) * lon
+                                + float(ic.temp_wave_phase1) * xp.sin(lat))
+                         + float(ic.temp_wave_weight2)
+                         * xp.sin(float(ic.temp_wave_lon2) * lon
+                                  + float(ic.temp_wave_phase2) * xp.sin(lat)))
+                        * xp.cos(lat) ** 2)
+                rh = rh * (1.0 + float(p.ideal_humidity_wave) * wave)
+            self.q_layers = xp.clip(
+                rh * qsat(xp, self.T_layers, self.pressure_layers_pa),
+                float(bounds.humidity_min),
+                float(bounds.humidity_max)).astype(xp.float32)
+            state = hydrostatic_state(
+                xp, self.T_layers, self.q_layers, self.surface_pressure,
+                self._sigma_interfaces_xp, float(dyn.top_pressure_pa),
+                self.surface_geopotential)
+
+        (self.pressure_interfaces_pa, self.pressure_layers_pa,
+         self.geopotential_layers, self.geopotential_interfaces,
+         self.virtual_temperature_layers) = state
+        self.h_layers = (
+            self.geopotential_layers / float(p.g_eff)).astype(xp.float32)
+        self.omega_layers = xp.zeros_like(self.T_layers)
+        self.sigma_dot_interfaces = xp.zeros(
+            (self.nz + 1, self.nlat, self.nlon), dtype=xp.float32)
+        self._sync_surface_views()
+
+    def _equilibrium_temperature_profile(self, base_temperature, height_agl):
+        """Tropospheric lapse rate with a capped, weakly warming stratosphere."""
+        xp, vp = self.xp, self.cfg.physics.vertical
+        tropopause = float(vp.tropopause_height_m)
+        tropospheric_height = xp.minimum(height_agl, tropopause)
+        temperature = (
+            base_temperature[None, :, :]
+            - float(vp.lapse_rate) * tropospheric_height)
+        temperature = xp.maximum(
+            temperature, float(vp.minimum_equilibrium_temp_k))
+        temperature += (
+            float(vp.stratosphere_lapse_rate)
+            * xp.maximum(height_agl - tropopause, 0.0))
+        return temperature
 
     def _sync_surface_views(self):
         """Keep the original two-dimensional API mapped to the lowest layer."""
@@ -491,7 +677,8 @@ class EarthModel:
         land_drag = float(p.drag_land_atmosphere)
         return self.ocean * ocean_drag + self.land * land_drag
 
-    def _surface_evaporation(self, surface_temp, air_humidity, wind_speed):
+    def _surface_evaporation(self, surface_temp, air_humidity, wind_speed,
+                             air_pressure=None, air_temperature=None):
         """Return total and land evaporation in kg m-2 s-1.
 
         One millimetre of ground water is one kg m-2, so the land flux can be
@@ -501,8 +688,17 @@ class EarthModel:
         capacity = float(p.ground_water_capacity_mm)
         wetness = xp.clip(self.ground_water / capacity, 0, 1)
         wetness **= float(p.ground_evap_exponent)
-        potential = (float(p.c_evap) * RHO_A * wind_speed
-                     * xp.maximum(qsat(xp, surface_temp) - air_humidity, 0))
+        if air_pressure is None:
+            air_pressure = float(
+                p.dynamics.reference_surface_pressure_pa)
+        if air_temperature is None:
+            density = RHO_A
+        else:
+            density = (air_pressure / xp.maximum(
+                RD * air_temperature * (1.0 + 0.608 * air_humidity), 1.0))
+        potential = (float(p.c_evap) * density * wind_speed
+                     * xp.maximum(qsat(xp, surface_temp, air_pressure)
+                                  - air_humidity, 0))
         ocean_evap = potential * self.ocean
         land_evap = (potential * float(p.land_evap) * wetness * self.land)
         land_evap = xp.minimum(land_evap, self.ground_water / self.dt)
@@ -651,7 +847,290 @@ class EarthModel:
             self._step_once()
 
     def _step_once(self):
+        if self._primitive_enabled:
+            return self._step_primitive_equations()
         return self._step_multilayer()
+
+    def _refresh_primitive_diagnostics(self):
+        """Refresh pressure, hydrostatic geopotential and geometric height."""
+        xp, p = self.xp, self.cfg.physics
+        state = hydrostatic_state(
+            xp, self.T_layers, self.q_layers, self.surface_pressure,
+            self._sigma_interfaces_xp, float(p.dynamics.top_pressure_pa),
+            self.surface_geopotential)
+        (self.pressure_interfaces_pa, self.pressure_layers_pa,
+         self.geopotential_layers, self.geopotential_interfaces,
+         self.virtual_temperature_layers) = state
+        self.h_layers = (
+            self.geopotential_layers / float(p.g_eff)).astype(xp.float32)
+
+    def _primitive_pressure_gradient(self, geopotential=None,
+                                     pressure=None, virtual_temperature=None):
+        """Pressure-gradient force on constant-sigma surfaces.
+
+        The second term transforms the hydrostatic geopotential gradient from
+        a sigma surface to a constant-pressure surface.  Together with the
+        surface geopotential in the hydrostatic integral this is the terrain
+        pressure-gradient cancellation required for resting stratified air.
+        """
+        xp, p, o = self.xp, self.cfg.physics, self.ops
+        geopotential = (self.geopotential_layers if geopotential is None
+                        else geopotential)
+        pressure = (self.pressure_layers_pa if pressure is None
+                    else pressure)
+        virtual_temperature = (
+            self.virtual_temperature_layers if virtual_temperature is None
+            else virtual_temperature)
+        phi_x, phi_y = o.gradient(geopotential)
+        logp_x, logp_y = o.gradient(xp.log(pressure))
+        # Evaluate alpha*grad(p) as Rd*Tv*grad(log p) with the same discrete
+        # gradient used for Phi. For an isothermal hydrostatic atmosphere
+        # Phi = Phi_s + Rd*T*log(ps/p), so terrain terms cancel to roundoff
+        # instead of leaving the classic sigma-coordinate mountain error.
+        coefficient = RD * virtual_temperature
+        return (phi_x + coefficient * logp_x,
+                phi_y + coefficient * logp_y)
+
+    def _primitive_boundary_drag(self, u, v):
+        """Physical surface stress distributed through the lowest sigma layers."""
+        xp, p, tp = (self.xp, self.cfg.physics,
+                     self.cfg.physics.topography)
+        z_agl = xp.maximum(
+            self.geopotential_layers / float(p.g_eff)
+            - self.surface_height[None, :, :], 0.0)
+        depth = max(float(tp.influence_height), 1.0)
+        vertical_weight = xp.exp(-z_agl / depth)
+        slope_roughness = xp.clip(
+            self.terrain_slope / max(float(tp.slope_scale), 1.0e-6), 0, 1)
+        roughness = (1.0 + self.land * float(tp.drag_multiplier)
+                     * slope_roughness)
+        rate = (self._surface_atmospheric_drag()[None, :, :]
+                * vertical_weight * roughness[None, :, :])
+        return -rate * u, -rate * v
+
+    def _step_primitive_equations(self):
+        """Advance the moist hydrostatic primitive equations in sigma space."""
+        xp, p, o, dt = self.xp, self.cfg.physics, self.ops, self.dt
+        dyn, bounds = p.dynamics, p.bounds
+        rt, sf, mt = p.radiation_transfer, p.surface_flux, p.moisture_transport
+        g = float(p.g_eff)
+        p_top = float(dyn.top_pressure_pa)
+        ds = self._sigma_thickness_xp[:, None, None]
+
+        # Diagnostics are initialized before the first step and refreshed at
+        # the end of every step. Recomputing them here duplicated a complete
+        # hydrostatic column integration.
+        u0, v0 = self.u_layers, self.v_layers
+        T0, q0, ps0, Ts = (
+            self.T_layers, self.q_layers, self.surface_pressure, self.Ts)
+        low_u, low_v, low_T, low_q = u0[0], v0[0], T0[0], q0[0]
+        low_p = self.pressure_layers_pa[0]
+        wind = (xp.sqrt(low_u * low_u + low_v * low_v)
+                + float(sf.wind_speed_floor_ms))
+
+        # Surface radiation and turbulent enthalpy exchange.
+        Q_sw, decl, sub_lon = insolation(
+            xp, o.lat, o.lon_rad, self.t, p.S0, p.diurnal_cycle)
+        self.subsolar = (float(decl), float(sub_lon))
+        greenhouse_q = xp.clip(
+            low_q / float(sf.humidity_greenhouse_scale), 0, 1)
+        if p.radiation:
+            albedo_surface = (
+                self.ocean * (p.alb_ocean * (1 - self.ice)
+                              + p.alb_ice * self.ice)
+                + self.land * (p.alb_land * (1 - self.snow)
+                               + p.alb_snow * self.snow))
+            albedo = xp.clip(
+                albedo_surface + p.alb_cloud * self.cloud,
+                0, float(rt.albedo_max))
+            SW_surface = (
+                Q_sw * (1 - albedo) * float(rt.surface_sw_fraction))
+            SW_air = (
+                Q_sw * (1 - float(rt.cloud_sw_absorption) * self.cloud)
+                * float(rt.air_sw_fraction))
+            LW_up = float(rt.surface_emissivity) * SIGMA * Ts ** 4
+            emissivity_down = xp.clip(
+                float(rt.down_emissivity_base)
+                + float(rt.down_emissivity_humidity) * greenhouse_q
+                + float(rt.down_emissivity_cloud) * self.cloud,
+                0, float(rt.down_emissivity_max))
+            LW_down = emissivity_down * SIGMA * low_T ** 4
+            olr_factor = xp.clip(
+                float(rt.olr_factor_base)
+                - float(rt.olr_factor_humidity) * greenhouse_q
+                - float(rt.olr_factor_cloud) * self.cloud,
+                float(rt.olr_factor_min), float(rt.olr_factor_max))
+            OLR = olr_factor * SIGMA * low_T ** 4
+        else:
+            SW_surface = SW_air = LW_up = LW_down = OLR = xp.zeros_like(low_T)
+
+        density0 = low_p / xp.maximum(
+            RD * low_T * (1.0 + 0.608 * low_q), 1.0)
+        sensible = (float(sf.sensible_heat_coeff) * density0 * CP * wind
+                    * (Ts - low_T))
+        if p.moisture:
+            evaporation, land_evaporation = self._surface_evaporation(
+                Ts, low_q, wind, low_p, low_T)
+            latent = LV * evaporation
+        else:
+            evaporation = land_evaporation = latent = xp.zeros_like(low_T)
+
+        surface_capacity = (
+            self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND)
+        Ts = Ts + dt * (
+            SW_surface + LW_down - LW_up - sensible - latent
+        ) / surface_capacity
+        Ts = xp.where(
+            self.ocean > 0.5,
+            xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)), Ts)
+
+        # Sigma-coordinate continuity: prognose ps and diagnose the shared
+        # interface mass flux. Both physical boundaries are impermeable.
+        ps_tendency, div_mass, interface_flux = sigma_mass_flux(
+            xp, o, u0, v0, ps0, self._sigma_thickness_xp, p_top)
+        ps_diff = float(dyn.surface_pressure_diffusivity)
+        if ps_diff:
+            ps_tendency = ps_tendency + ps_diff * o.lap(ps0)
+        ps1 = xp.clip(
+            ps0 + dt * ps_tendency,
+            float(dyn.min_surface_pressure_pa),
+            float(dyn.max_surface_pressure_pa))
+        mu0 = ps0 - p_top
+        mu1 = ps1 - p_top
+
+        def transport(field, diffusivity):
+            return mass_consistent_transport(
+                xp, o, field, u0, v0, mu0, mu1,
+                self._sigma_thickness_xp, div_mass, interface_flux,
+                diffusivity, dt)
+
+        u = transport(u0, p.visc)
+        v = transport(v0, p.visc)
+        T = transport(T0, p.diff_T)
+        q = transport(q0, p.diff_q) if p.moisture else q0.copy()
+
+        # Hydrostatic pressure-gradient force, metric terms, Coriolis force,
+        # and boundary-layer stress. Empirical mountain lift/blocking is not
+        # added here; terrain is already present in the coordinate and PGF.
+        # Use the newly predicted mass/thermodynamic state for the PGF. This
+        # symplectic ordering keeps the external hydrostatic gravity mode
+        # bounded; evaluating both ps and wind tendencies at the old state is
+        # a forward-Euler oscillator and is unconditionally unstable.
+        pressure_state = hydrostatic_state(
+            xp, T, q, ps1, self._sigma_interfaces_xp, p_top,
+            self.surface_geopotential)
+        pgf_x, pgf_y = self._primitive_pressure_gradient(
+            pressure_state[2], pressure_state[1], pressure_state[4])
+        drag_u, drag_v = self._primitive_boundary_drag(u0, v0)
+        u += dt * (-pgf_x + drag_u + o.tanl * u0 * v0)
+        v += dt * (-pgf_y + drag_v - o.tanl * u0 * u0)
+        u, v = o.coriolis_rotate(u, v, dt)
+
+        # Pressure velocity and adiabatic compression/expansion.
+        omega = pressure_vertical_velocity(
+            xp, o, u0, v0, ps0, ps_tendency, interface_flux,
+            self._sigma_centres_xp, p_top)
+        T += dt * KAPPA * T0 * omega / xp.maximum(
+            self.pressure_layers_pa, 1.0)
+
+        layer_mass = xp.maximum(mu1[None, :, :] * ds / g, 1.0)
+        lowest_mass = layer_mass[0]
+        air_heating = (
+            sensible + SW_air
+            + float(rt.air_longwave_coupling) * (LW_up - LW_down) - OLR)
+        T[0] += dt * air_heating / (lowest_mass * CP)
+        if p.moisture:
+            q[0] += dt * evaporation / lowest_mass
+
+        if p.radiation:
+            seasonal = (
+                float(rt.seasonal_temp_base_k)
+                - float(rt.seasonal_temp_pole_delta_k) * xp.sin(o.lat) ** 2
+                + float(rt.seasonal_temp_amp_k) * xp.sin(o.lat)
+                * _np.sin(_np.radians(self.subsolar[0]) * 2))
+            z_agl = xp.maximum(
+                self.geopotential_layers / g
+                - self.surface_height[None, :, :], 0.0)
+            equilibrium = self._equilibrium_temperature_profile(
+                seasonal, z_agl)
+            T += dt / float(p.tau_relax_T) * (equilibrium - T)
+
+        # Pressure-dependent saturation adjustment and column water budget.
+        div = o.divergence(u, v)
+        rain_mass = xp.zeros_like(ps1)
+        if p.moisture:
+            # In a pure sigma coordinate, layer pressure depends only on ps1
+            # and sigma, not on the later T/q tendencies. Reuse the pressure
+            # already diagnosed for the pressure-gradient state.
+            pressure = pressure_state[1]
+            saturation = qsat(xp, T, pressure)
+            rh_effective = self._effective_condensation_rh(div)
+            condensed = xp.maximum(
+                q - rh_effective * saturation, 0) * (
+                    1 - _np.exp(-dt / float(p.tau_cond)))
+            q *= 1 - dt * float(mt.subsidence_drying_coeff) * xp.clip(
+                div, 0, float(mt.subsidence_divergence_max))
+            q -= condensed
+            T += (LV / CP) * condensed
+            rain_mass = (condensed * layer_mass).sum(axis=0)
+            self.precip = (rain_mass / dt * 3600.0).astype(xp.float32)
+            self._update_ground_water(land_evaporation, rain_mass)
+            relative_humidity = xp.clip(
+                q / qsat(xp, T, pressure),
+                float(mt.relative_humidity_min),
+                float(bounds.relative_humidity_max))
+            cloud_diagnostic = self._diagnostic_cloud(
+                relative_humidity, div)
+            self.cloud = self._update_cloud_cover(
+                cloud_diagnostic, relative_humidity, div)
+
+        # Water crossing the lower boundary changes total atmospheric mass;
+        # precipitation leaves it. This term is small but closes the budget.
+        ps1 = xp.clip(
+            ps1 + g * (dt * evaporation - rain_mass),
+            float(dyn.min_surface_pressure_pa),
+            float(dyn.max_surface_pressure_pa))
+
+        u = o.polar_filter(u)
+        v = o.polar_filter(v)
+        T = o.polar_filter(T)
+        q = o.polar_filter(q)
+        self.u_layers = xp.clip(u, -p.umax, p.umax).astype(xp.float32)
+        self.v_layers = xp.clip(v, -p.umax, p.umax).astype(xp.float32)
+        self.T_layers = xp.clip(
+            T, float(bounds.air_temp_min_k),
+            float(bounds.air_temp_max_k)).astype(xp.float32)
+        self.q_layers = xp.clip(
+            q, float(bounds.humidity_min),
+            float(bounds.humidity_max)).astype(xp.float32)
+        self.surface_pressure = ps1.astype(xp.float32)
+        self.Ts = xp.clip(
+            self._advance_ocean(Ts, self.u_layers[0], self.v_layers[0]),
+            float(bounds.surface_temp_min_k),
+            float(bounds.surface_temp_max_k)).astype(xp.float32)
+
+        self._refresh_primitive_diagnostics()
+        self.omega_layers = omega.astype(xp.float32)
+        mu = xp.maximum(
+            self.surface_pressure - p_top, xp.float32(1.0))
+        self.sigma_dot_interfaces = (
+            interface_flux / mu[None, :, :]).astype(xp.float32)
+        vertical_velocity = (
+            -RD * self.virtual_temperature_layers * omega
+            / xp.maximum(g * self.pressure_layers_pa, 1.0))
+        # At a terrain-following impermeable lower boundary, geometric w is
+        # u·grad(zs), not zero. sigma_dot is exactly zero there.
+        terrain_w = (
+            self.u_layers[0] * self.terrain_slope_x
+            + self.v_layers[0] * self.terrain_slope_y)
+        vertical_velocity[0] = terrain_w
+        self.w_layers = xp.clip(
+            vertical_velocity, -float(p.vertical.w_max),
+            float(p.vertical.w_max)).astype(xp.float32)
+        self._sync_surface_views()
+        self._diag_surface()
+        self.t += _dt.timedelta(seconds=dt)
+        self.step_count += 1
 
     def _step_once_legacy(self):
         xp, p, o, dt = self.xp, self.cfg.physics, self.ops, self.dt
@@ -1013,6 +1492,8 @@ class EarthModel:
                 qsat(xp, old_T), float(bounds.humidity_min),
                 float(edit.air_humidity_max)).astype(xp.float32)
             self._sync_surface_views()
+            if self._primitive_enabled:
+                self._refresh_primitive_diagnostics()
 
     def _regional_weight(self, lat_deg, lon_deg, radius_km):
         xp = self.xp
@@ -1075,7 +1556,15 @@ class EarthModel:
 
     # ------------------------------------------------------------
     def pressure_hpa(self):
-        """把厚度场映射为习惯的海平面气压 (hPa), 仅用于展示。"""
+        """Return hydrostatically reduced mean sea-level pressure in hPa."""
+        if self._primitive_enabled:
+            # Hypsometric reduction using the lowest-layer virtual
+            # temperature. Unlike the old h mapping, ps itself is prognostic.
+            exponent = self.xp.clip(
+                self.surface_geopotential / self.xp.maximum(
+                    RD * self.virtual_temperature_layers[0], 1.0),
+                -2.0, 2.0)
+            return self.surface_pressure * self.xp.exp(exponent) / 100.0
         pressure = self.cfg.physics.pressure
         return (float(pressure.mslp_reference_hpa)
                 + (self.h - self.cfg.physics.H0)
@@ -1100,6 +1589,11 @@ class EarthModel:
         if include_layers:
             fields["u_layers"] = to_cpu(self.u_layers)
             fields["v_layers"] = to_cpu(self.v_layers)
+            if self._primitive_enabled:
+                fields["pressure_layers_pa"] = to_cpu(
+                    self.pressure_layers_pa)
+                fields["surface_pressure_pa"] = to_cpu(
+                    self.surface_pressure)
             if self.ocean_layers_enabled:
                 fields["sst_deep"] = to_cpu(self.To_deep) - 273.15
                 fields["uo_deep"] = to_cpu(self.uo_deep)
@@ -1110,7 +1604,7 @@ class EarthModel:
         """Export all vertical levels, or one grid-column, for diagnostics."""
         selector = ((slice(None), slice(None), slice(None)) if lat_index is None
                     else (slice(None), int(lat_index), int(lon_index)))
-        return {
+        result = {
             "levels_m": self.levels_m.copy(),
             "temp_k": to_cpu(self.T_layers[selector]),
             "humidity": to_cpu(self.q_layers[selector]),
@@ -1119,6 +1613,12 @@ class EarthModel:
             "w": to_cpu(self.w_layers[selector]),
             "height": to_cpu(self.h_layers[selector]),
         }
+        if self._primitive_enabled:
+            result["pressure_pa"] = to_cpu(
+                self.pressure_layers_pa[selector])
+            result["omega_pa_s"] = to_cpu(self.omega_layers[selector])
+            result["sigma"] = self.sigma_centres.copy()
+        return result
 
     def check_health(self):
         import numpy as np

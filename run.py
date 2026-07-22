@@ -11,6 +11,7 @@ import time
 
 
 def main():
+    startup_started = time.perf_counter()
     ap = argparse.ArgumentParser(description="EarthSim 地球天气模拟")
     ap.add_argument("command", choices=["serve", "precompute", "benchmark"])
     ap.add_argument("-c", "--config", default="config.yaml")
@@ -18,9 +19,14 @@ def main():
     ap.add_argument("--days", type=float, default=None, help="预演算天数")
     ap.add_argument("--port", type=int, default=None)
     args = ap.parse_args()
+    print(f"[startup] arguments parsed: "
+          f"{time.perf_counter() - startup_started:.3f}s", flush=True)
 
+    stage_started = time.perf_counter()
     from sim.config import load_config
     cfg = load_config(args.config)
+    print(f"[startup] config loaded ({args.config}): "
+          f"{time.perf_counter() - stage_started:.3f}s", flush=True)
 
     if args.command == "precompute":
         from sim.precompute import run_precompute
@@ -40,11 +46,19 @@ def main():
               f"模拟加速比 x{n*m.dt/el:.0f})")
 
     else:  # serve
+        stage_started = time.perf_counter()
         import uvicorn
         from server import create_app
+        print(f"[startup] server modules imported: "
+              f"{time.perf_counter() - stage_started:.3f}s", flush=True)
+        stage_started = time.perf_counter()
         app = create_app(cfg, playback_dir=args.playback)
+        print(f"[startup] application created: "
+              f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         host = cfg.server.host
         port = args.port or int(cfg.server.port)
+        print(f"[startup] ready to hand off to uvicorn: "
+              f"{time.perf_counter() - startup_started:.3f}s total", flush=True)
         print(f"打开浏览器访问  http://localhost:{port}")
         uvicorn.run(app, host=host, port=port, log_level="warning")
 

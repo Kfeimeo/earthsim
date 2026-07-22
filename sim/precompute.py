@@ -38,6 +38,11 @@ def run_precompute(cfg, days=None, progress=True):
         "atmosphere_levels_m": model.levels_m.tolist(),
         "times": [],
     }
+    if getattr(model, "_primitive_enabled", False):
+        manifest["dynamics_core"] = "primitive_equations"
+        manifest["sigma_interfaces"] = model.sigma_interfaces.tolist()
+        manifest["top_pressure_pa"] = float(
+            model.cfg.physics.dynamics.top_pressure_pa)
 
     t0 = time.time()
     frame_iter = range(nframes)

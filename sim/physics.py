@@ -20,6 +20,9 @@ OMEGA = 7.292e-5
 SIGMA = 5.67e-8
 CP = 1004.0
 LV = 2.5e6
+RD = 287.0
+RV = 461.5
+KAPPA = RD / CP
 RHO_A = 1.2
 P0 = 1.0e5
 MCOL = 1.0e4          # 大气柱质量 kg/m^2
@@ -150,10 +153,16 @@ class Ops:
 
 
 # ---------- 热力学工具 ----------
-def qsat(xp, T):
-    """饱和比湿 (Tetens 公式)。"""
+def qsat(xp, T, pressure=P0):
+    """Return saturation specific humidity at temperature and pressure.
+
+    ``pressure`` may be a scalar or an array in Pa.  The denominator uses the
+    exact moist-air conversion rather than assuming every model level is at
+    1000 hPa.
+    """
     es = 610.78 * xp.exp(17.27 * (T - 273.15) / xp.maximum(T - 35.85, 1.0))
-    return 0.622 * es / P0
+    p = xp.maximum(pressure, es + 1.0)
+    return 0.622 * es / xp.maximum(p - 0.378 * es, 1.0)
 
 
 def insolation(xp, lat_rad, lon_rad, t_utc, S0, diurnal=True):

@@ -5,13 +5,16 @@ _module = None
 _adv_diff = None
 _gradient = None
 _divergence = None
+_mass_transport = None
+_hydrostatic_column = None
 _polar_filter = None
 _ADV_BLOCK = (16, 16)  # Must match the static shared-memory tile in kernels.cu.
 _POLAR_BLOCK = (256,)
 
 
 def load():
-    global _module, _adv_diff, _gradient, _divergence, _polar_filter
+    global _module, _adv_diff, _gradient, _divergence
+    global _mass_transport, _hydrostatic_column, _polar_filter
     if _module is not None:
         return True
     try:
@@ -23,6 +26,8 @@ def load():
         _adv_diff = _module.get_function("adv_diff")
         _gradient = _module.get_function("gradient")
         _divergence = _module.get_function("divergence")
+        _mass_transport = _module.get_function("mass_transport")
+        _hydrostatic_column = _module.get_function("hydrostatic_column")
         _polar_filter = _module.get_function("polar_filter")
         return True
     except Exception:
@@ -105,6 +110,94 @@ def divergence(u, v, invdx, invdy, coslat, invcoslat):
                 (u, v, invdx, coslat, invcoslat, cp.float32(invdy), out,
                  cp.int32(nlat), cp.int32(nlon)))
     return out
+
+
+def mass_transport(field, u, v, mu_old, mu_new, sigma_thickness,
+                   div_mass, interface_flux, invdx, invdy,
+                   diffusivity, dt):
+    """Flux-form horizontal/vertical transport for a batched 3-D field."""
+    import cupy as cp
+    field, nlat, nlon, block, grid = _field_layout(cp, field)
+    if field.ndim != 3:
+        raise ValueError("mass transport requires a 3-D [level, lat, lon] field")
+    nz = field.shape[0]
+    expected = field.shape
+    for name, array in (("u", u), ("v", v), ("div_mass", div_mass)):
+        if array.shape != expected or array.dtype != cp.float32:
+            raise ValueError(f"{name} must match the float32 field shape")
+    if interface_flux.shape != (nz + 1, nlat, nlon):
+        raise ValueError("interface_flux must have shape [nz+1, nlat, nlon]")
+    if interface_flux.dtype != cp.float32:
+        raise TypeError("interface_flux must be float32")
+    if mu_old.shape != (nlat, nlon) or mu_new.shape != (nlat, nlon):
+        raise ValueError("column mass arrays must match [nlat, nlon]")
+
+    u = cp.ascontiguousarray(u)
+    v = cp.ascontiguousarray(v)
+    mu_old = cp.ascontiguousarray(mu_old, dtype=cp.float32)
+    mu_new = cp.ascontiguousarray(mu_new, dtype=cp.float32)
+    sigma_thickness = cp.ascontiguousarray(
+        cp.asarray(sigma_thickness, dtype=cp.float32))
+    div_mass = cp.ascontiguousarray(div_mass)
+    interface_flux = cp.ascontiguousarray(interface_flux)
+    invdx = cp.ascontiguousarray(invdx, dtype=cp.float32)
+    if sigma_thickness.size != nz or invdx.size != nlat:
+        raise ValueError("transport metric arrays do not match the field")
+
+    out = cp.empty_like(field)
+    _mass_transport(
+        grid, block,
+        (field, u, v, mu_old, mu_new, sigma_thickness,
+         div_mass, interface_flux, invdx, cp.float32(invdy),
+         cp.float32(diffusivity), cp.float32(dt), out,
+         cp.int32(nz), cp.int32(nlat), cp.int32(nlon)))
+    return out
+
+
+def hydrostatic_state(temperature, humidity, surface_pressure,
+                      sigma_interfaces, top_pressure,
+                      surface_geopotential, gas_constant):
+    """Integrate hydrostatic pressure/geopotential for every GPU column."""
+    import cupy as cp
+    temperature, nlat, nlon, _, _ = _field_layout(cp, temperature)
+    if temperature.ndim != 3:
+        raise ValueError("hydrostatic state requires [level, lat, lon] arrays")
+    nz = temperature.shape[0]
+    if humidity.shape != temperature.shape or humidity.dtype != cp.float32:
+        raise ValueError("humidity must match the float32 temperature field")
+    if surface_pressure.shape != (nlat, nlon):
+        raise ValueError("surface pressure must match [nlat, nlon]")
+    if surface_geopotential.shape != (nlat, nlon):
+        raise ValueError("surface geopotential must match [nlat, nlon]")
+
+    humidity = cp.ascontiguousarray(humidity)
+    surface_pressure = cp.ascontiguousarray(
+        surface_pressure, dtype=cp.float32)
+    surface_geopotential = cp.ascontiguousarray(
+        surface_geopotential, dtype=cp.float32)
+    sigma_interfaces = cp.ascontiguousarray(
+        cp.asarray(sigma_interfaces, dtype=cp.float32))
+    if sigma_interfaces.size != nz + 1:
+        raise ValueError("sigma interface count must be nz + 1")
+
+    interface_shape = (nz + 1, nlat, nlon)
+    pressure_interfaces = cp.empty(interface_shape, dtype=cp.float32)
+    pressure_layers = cp.empty_like(temperature)
+    geopotential_layers = cp.empty_like(temperature)
+    geopotential_interfaces = cp.empty(interface_shape, dtype=cp.float32)
+    virtual_temperature = cp.empty_like(temperature)
+    cells = nlat * nlon
+    block = (256,)
+    grid = ((cells + block[0] - 1) // block[0],)
+    _hydrostatic_column(
+        grid, block,
+        (temperature, humidity, surface_pressure, sigma_interfaces,
+         surface_geopotential, cp.float32(top_pressure),
+         cp.float32(gas_constant), pressure_interfaces, pressure_layers,
+         geopotential_layers, geopotential_interfaces, virtual_temperature,
+         cp.int32(nz), cp.int32(cells)))
+    return (pressure_interfaces, pressure_layers, geopotential_layers,
+            geopotential_interfaces, virtual_temperature)
 
 
 def polar_filter(F, weights, passes):

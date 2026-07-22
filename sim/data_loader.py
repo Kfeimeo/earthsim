@@ -27,6 +27,7 @@ _LON_NAMES = ("longitude", "lon", "nav_lon", "x")
 _TIME_NAMES = ("time", "valid_time", "forecast_reference_time", "date")
 _LEVEL_NAMES = ("level", "pressure_level", "isobaricInhPa", "plev",
                 "height", "heightAboveGround", "altitude", "z")
+_SOURCE_TIME_PREFIX = "__earthsim_source_time_"
 
 
 def _as_paths(value) -> list[str]:
@@ -46,12 +47,24 @@ def _open_datasets(paths: Iterable[str]):
         ) from exc
 
     datasets = []
-    for path in paths:
+    for source_index, path in enumerate(paths):
         if not os.path.exists(path):
             raise FileNotFoundError(f"real-data file not found: {path}")
         try:
-            datasets.append(xr.open_dataset(path))
+            ds = xr.open_dataset(path)
+            # Keep each file's time axis independent.  xr.merge with an outer
+            # join otherwise expands variables onto the union of all snapshot
+            # times.  Selecting a time that only exists in another file then
+            # returns an all-NaN field, which the model replaces by one global
+            # fallback value.
+            time_name = _coord_name(ds, _TIME_NAMES, "time")
+            if time_name and time_name in ds.dims:
+                ds = ds.rename(
+                    {time_name: f"{_SOURCE_TIME_PREFIX}{source_index}"})
+            datasets.append(ds)
         except Exception as exc:
+            for opened in datasets:
+                opened.close()
             raise RealDataError(f"cannot open NetCDF file {path}: {exc}") from exc
     if not datasets:
         return None
@@ -65,11 +78,17 @@ def _open_datasets(paths: Iterable[str]):
         raise RealDataError(f"cannot merge real-data files: {exc}") from exc
 
 
-def _coord_name(ds, candidates, kind: str):
+def _coord_name(ds, candidates, kind: str, *, dims=None):
+    allowed = set(dims) if dims is not None else None
     for name in candidates:
-        if name in ds.coords or name in ds.dims:
+        if ((allowed is None or name in allowed)
+                and (name in ds.coords or name in ds.dims)):
             return name
     for name, coord in ds.coords.items():
+        if allowed is not None and name not in allowed:
+            continue
+        if kind == "time" and name.startswith(_SOURCE_TIME_PREFIX):
+            return name
         standard = str(coord.attrs.get("standard_name", "")).lower()
         axis = str(coord.attrs.get("axis", "")).upper()
         if kind == "lat" and (standard == "latitude" or axis == "Y"):
@@ -100,8 +119,8 @@ def _find_variable(ds, aliases, *, exclude=()):
 
 
 def _select_time(da, ds, target):
-    time_name = _coord_name(ds, _TIME_NAMES, "time")
-    if not time_name or time_name not in da.dims:
+    time_name = _coord_name(ds, _TIME_NAMES, "time", dims=da.dims)
+    if not time_name:
         return da
     if target:
         try:
@@ -223,7 +242,8 @@ def _level_kind(ds, name):
     return "pressure" if np.nanmax(values) > 150 else "height"
 
 
-def _profile(da, ds, target_time, target_lats, target_lons, levels_m):
+def _profile(da, ds, target_time, target_lats, target_lons, levels_m,
+             reference_pressure_pa=101325.0, scale_height_m=8400.0):
     level_name, source_levels = _pressure_or_height(da, ds)
     if not level_name:
         return np.stack([_horizontal(da, ds, target_time, target_lats, target_lons)
@@ -238,7 +258,8 @@ def _profile(da, ds, target_time, target_lats, target_lons, levels_m):
         units = str(ds[level_name].attrs.get("units", "")).lower()
         if units in {"hpa", "mb", "millibar"} or np.nanmax(source_levels) < 2000:
             source_levels *= 100.0
-        target_coord = 101325.0 * np.exp(-np.asarray(levels_m) / 8400.0)
+        target_coord = float(reference_pressure_pa) * np.exp(
+            -np.asarray(levels_m) / float(scale_height_m))
     else:
         target_coord = np.asarray(levels_m, dtype=np.float64)
     order = np.argsort(source_levels)
@@ -285,12 +306,25 @@ def _convert(values, da, default=1.0):
     return values * factor
 
 
+def _saturation_specific_humidity(temp_k, pressure_pa):
+    """Match the model's saturation-humidity formula for NumPy fields."""
+    es = 610.78 * np.exp(
+        17.27 * (temp_k - 273.15) / np.maximum(temp_k - 35.85, 1.0))
+    pressure = np.maximum(pressure_pa, es + 1.0)
+    return 0.622 * es / np.maximum(pressure - 0.378 * es, 1.0)
+
+
 def _find_and_field(ds, aliases, target_time, target_lats, target_lons,
-                    *, profile=False, levels_m=()):
+                    *, profile=False, levels_m=(),
+                    profile_reference_pressure_pa=101325.0,
+                    profile_scale_height_m=8400.0):
     da = _find_variable(ds, aliases)
     if da is None:
         return None, None
-    result = (_profile(da, ds, target_time, target_lats, target_lons, levels_m)
+    result = (_profile(
+        da, ds, target_time, target_lats, target_lons, levels_m,
+        reference_pressure_pa=profile_reference_pressure_pa,
+        scale_height_m=profile_scale_height_m)
               if profile else _horizontal(da, ds, target_time, target_lats, target_lons))
     return result, da
 
@@ -306,11 +340,24 @@ def load_real_initialization(cfg, lats, lons, levels_m):
     if atmosphere is None:
         raise FileNotFoundError("data.atmosphere_file is empty")
     target_time = getattr(data_cfg, "init_time", "") or str(cfg.time.start)
+    physics = cfg.physics
+    initial = physics.initial_conditions
+    vertical = physics.vertical
+    reference_pressure_pa = float(
+        physics.dynamics.reference_surface_pressure_pa)
+    scale_height_m = max(
+        float(vertical.scale_height), float(vertical.scale_height_min_m))
+    target_pressure_pa = reference_pressure_pa * np.exp(
+        -np.asarray(levels_m, dtype=np.float64) / scale_height_m)
+    profile_options = {
+        "profile_reference_pressure_pa": reference_pressure_pa,
+        "profile_scale_height_m": scale_height_m,
+    }
     fields = {}
     try:
         temp, temp_da = _find_and_field(
             atmosphere, ("t", "temperature", "air_temperature"), target_time,
-            lats, lons, profile=True, levels_m=levels_m)
+            lats, lons, profile=True, levels_m=levels_m, **profile_options)
         t2m, t2m_da = _find_and_field(
             atmosphere, ("t2m", "2m_temperature", "air_temperature_2m"),
             target_time, lats, lons)
@@ -318,14 +365,16 @@ def load_real_initialization(cfg, lats, lons, levels_m):
             raise RealDataError("real atmosphere data has no temperature variable")
         if temp is None:
             t2m = _temperature(t2m, t2m_da)
-            temp = np.stack([t2m - 0.0065 * (z - levels_m[0])
+            lapse_rate = float(vertical.lapse_rate)
+            temp = np.stack([t2m - lapse_rate * (z - levels_m[0])
                              for z in levels_m]).astype(np.float32)
         else:
             temp = _temperature(temp, temp_da)
 
         q, q_da = _find_and_field(
             atmosphere, ("q", "specific_humidity", "specific_humidity_kgkg"),
-            target_time, lats, lons, profile=True, levels_m=levels_m)
+            target_time, lats, lons, profile=True, levels_m=levels_m,
+            **profile_options)
         q2, q2_da = _find_and_field(
             atmosphere, ("q2m", "2m_specific_humidity", "specific_humidity_2m"),
             target_time, lats, lons)
@@ -333,29 +382,44 @@ def load_real_initialization(cfg, lats, lons, levels_m):
             atmosphere, ("d2m", "2m_dewpoint_temperature", "dewpoint_2m"),
             target_time, lats, lons)
         if q is None:
+            humidity_decay_height_m = max(
+                float(initial.humidity_decay_height_m), 1.0)
+            level_offset = np.maximum(
+                np.asarray(levels_m, dtype=np.float64) - float(levels_m[0]),
+                0.0)
+            specific_humidity_decay = np.exp(
+                -level_offset / humidity_decay_height_m)[:, None, None]
             if q2 is not None:
-                q = np.stack([q2] * len(levels_m)).astype(np.float32)
+                q2 = _convert(q2, q2_da)
+                q = (q2[None, :, :] * specific_humidity_decay).astype(
+                    np.float32)
             elif d2m is not None:
                 td = _temperature(d2m, d2m_da)
-                # The qsat approximation used by the model is also the
-                # safest conversion for matching its moisture definition.
-                es = 610.78 * np.exp(17.27 * (td - 273.15)
-                                     / np.maximum(td - 35.85, 1.0))
-                q = np.stack([0.8 * 0.622 * es / 1e5] * len(levels_m))
+                q_surface = _saturation_specific_humidity(
+                    td, reference_pressure_pa)
+                q = (q_surface[None, :, :] * specific_humidity_decay).astype(
+                    np.float32)
             else:
-                q = np.empty_like(temp)
-                es = 610.78 * np.exp(17.27 * (temp - 273.15)
-                                     / np.maximum(temp - 35.85, 1.0))
-                q[:] = 0.65 * 0.622 * es / 1e5
+                surface_rh = float(physics.init_surface_rh)
+                upper_rh = float(physics.init_upper_rh)
+                rh = (upper_rh + (surface_rh - upper_rh)
+                      * np.exp(-np.asarray(levels_m, dtype=np.float64)
+                               / humidity_decay_height_m))
+                q = (rh[:, None, None]
+                     * _saturation_specific_humidity(
+                         temp, target_pressure_pa[:, None, None])).astype(
+                             np.float32)
         else:
             q = _convert(q, q_da)
 
         u, u_da = _find_and_field(
             atmosphere, ("u", "u_component_of_wind", "eastward_wind"),
-            target_time, lats, lons, profile=True, levels_m=levels_m)
+            target_time, lats, lons, profile=True, levels_m=levels_m,
+            **profile_options)
         v, v_da = _find_and_field(
             atmosphere, ("v", "v_component_of_wind", "northward_wind"),
-            target_time, lats, lons, profile=True, levels_m=levels_m)
+            target_time, lats, lons, profile=True, levels_m=levels_m,
+            **profile_options)
         u10, u10_da = _find_and_field(
             atmosphere, ("u10", "10m_u_component_of_wind", "10m_eastward_wind"),
             target_time, lats, lons)
@@ -376,7 +440,9 @@ def load_real_initialization(cfg, lats, lons, levels_m):
             mslp = _convert(mslp, mslp_da)
             mslp_hpa = mslp / 100.0
         else:
-            mslp_hpa = np.full((len(lats), len(lons)), 1013.0, np.float32)
+            mslp_hpa = np.full(
+                (len(lats), len(lons)),
+                float(initial.real_default_mslp_hpa), np.float32)
 
         skin, skin_da = _find_and_field(
             atmosphere, ("skt", "skin_temperature", "surface_temperature"),

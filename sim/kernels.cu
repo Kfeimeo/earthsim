@@ -154,6 +154,117 @@ __global__ void divergence(
     out[base + i * nlon + j] = dudx + dvcdy * invcoslat[i];
 }
 
+// Flux-form transport in terrain-following sigma coordinates. Each thread
+// owns one [level, latitude, longitude] cell and applies both adjacent
+// interface fluxes directly, avoiding a Python loop over vertical interfaces.
+__global__ void mass_transport(
+    const float* __restrict__ field,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ mu_old,          // [nlat, nlon]
+    const float* __restrict__ mu_new,          // [nlat, nlon]
+    const float* __restrict__ sigma_thickness, // [nz]
+    const float* __restrict__ div_mass,        // [nz, nlat, nlon]
+    const float* __restrict__ interface_flux,  // [nz+1, nlat, nlon]
+    const float* __restrict__ invdx,           // [nlat]
+    float invdy, float diffusivity, float dt,
+    float* __restrict__ out,
+    int nz, int nlat, int nlon)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z;
+    if (k >= nz || i >= nlat || j >= nlon) return;
+
+    int cells = nlat * nlon;
+    int col = i * nlon + j;
+    int idx = k * cells + col;
+    int west = j == 0 ? nlon - 1 : j - 1;
+    int east = j + 1 == nlon ? 0 : j + 1;
+    int south = i == 0 ? 0 : i - 1;
+    int north = i + 1 == nlat ? nlat - 1 : i + 1;
+
+    float f = field[idx];
+    float fw = field[k * cells + i * nlon + west];
+    float fe = field[k * cells + i * nlon + east];
+    float fs = field[k * cells + south * nlon + j];
+    float fn = field[k * cells + north * nlon + j];
+    float uu = u[idx];
+    float vv = v[idx];
+    float idx_ = invdx[i];
+
+    float dfdx = uu > 0.0f ? (f - fw) * idx_ : (fe - f) * idx_;
+    float dfdy = vv > 0.0f ? (f - fs) * invdy : (fn - f) * invdy;
+    float advective = -(uu * dfdx + vv * dfdy);
+    float ds = sigma_thickness[k];
+    float mu0 = mu_old[col];
+    float numerator = mu0 * ds * f
+                    + dt * ds * (-f * div_mass[idx] + mu0 * advective);
+
+    if (k < nz - 1) {
+        float flux = interface_flux[(k + 1) * cells + col];
+        float upstream = flux >= 0.0f ? field[idx + cells] : f;
+        numerator += dt * flux * upstream;
+    }
+    if (k > 0) {
+        float flux = interface_flux[k * cells + col];
+        float upstream = flux >= 0.0f ? f : field[idx - cells];
+        numerator -= dt * flux * upstream;
+    }
+
+    float result = numerator / fmaxf(mu_new[col] * ds, 1.0f);
+    if (diffusivity != 0.0f) {
+        float lap = (fw + fe - 2.0f * f) * idx_ * idx_
+                  + (fn + fs - 2.0f * f) * invdy * invdy;
+        result += dt * diffusivity * lap;
+    }
+    out[idx] = result;
+}
+
+// Hydrostatic integration in a sigma column. One thread owns one horizontal
+// column and walks from the surface to the model top.
+__global__ void hydrostatic_column(
+    const float* __restrict__ temperature,       // [nz, nlat, nlon]
+    const float* __restrict__ humidity,          // [nz, nlat, nlon]
+    const float* __restrict__ surface_pressure,  // [nlat, nlon]
+    const float* __restrict__ sigma_interfaces,  // [nz+1]
+    const float* __restrict__ surface_geopotential,
+    float top_pressure, float gas_constant,
+    float* __restrict__ pressure_interfaces,
+    float* __restrict__ pressure_layers,
+    float* __restrict__ geopotential_layers,
+    float* __restrict__ geopotential_interfaces,
+    float* __restrict__ virtual_temperature,
+    int nz, int cells)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cells) return;
+
+    float mu = surface_pressure[col] - top_pressure;
+    float phi_bottom = surface_geopotential[col];
+    pressure_interfaces[col] =
+        top_pressure + sigma_interfaces[0] * mu;
+    geopotential_interfaces[col] = phi_bottom;
+
+    for (int k = 0; k < nz; ++k) {
+        int idx = k * cells + col;
+        float p_bottom = top_pressure + sigma_interfaces[k] * mu;
+        float p_upper = top_pressure + sigma_interfaces[k + 1] * mu;
+        float p_mid = 0.5f * (p_bottom + p_upper);
+        float tv = temperature[idx] * (1.0f + 0.608f * humidity[idx]);
+        float coefficient = gas_constant * tv;
+        float phi_mid = phi_bottom + coefficient * logf(p_bottom / p_mid);
+        float phi_upper = phi_bottom + coefficient * logf(p_bottom / p_upper);
+
+        pressure_layers[idx] = p_mid;
+        virtual_temperature[idx] = tv;
+        geopotential_layers[idx] = phi_mid;
+        pressure_interfaces[(k + 1) * cells + col] = p_upper;
+        geopotential_interfaces[(k + 1) * cells + col] = phi_upper;
+        phi_bottom = phi_upper;
+    }
+}
+
 // Apply every zonal 1-2-1 pass inside one block. Each block owns one complete
 // latitude ring, allowing synchronization between passes without a new launch.
 // Leading dimensions are treated as a batch of [nlat, nlon] fields.

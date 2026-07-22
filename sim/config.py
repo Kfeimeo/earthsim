@@ -26,8 +26,15 @@ DEFAULTS = {
     "physics": {
         "moisture": True, "radiation": True, "ocean": True,
         "ice_albedo": True, "diurnal_cycle": True,
+        "dynamics": {
+            "core": "primitive_equations",  # primitive_equations | shallow_water
+            "top_pressure_pa": 10000.0,
+            "reference_surface_pressure_pa": 101300.0,
+            "min_surface_pressure_pa": 25000.0,
+            "max_surface_pressure_pa": 120000.0,
+            "surface_pressure_diffusivity": 0.0,
+        },
         "H0": 800.0, "g_eff": 9.8, "beta_T": 22.0, "tau_h": 43200.0,
-        "drag": 6.0e-6,
         "drag_ocean_atmosphere": 4.0e-6,
         "drag_land_atmosphere": 1.2e-5,
         "visc": 8.0e4, "diff_T": 4.0e4, "diff_q": 2.0e4,
@@ -167,7 +174,11 @@ DEFAULTS = {
         "vertical": {
             "enabled": True,
             "levels_m": [100.0, 1000.0, 3000.0, 6000.0, 10000.0],
+            "sigma_interfaces": [1.0, 0.90, 0.65, 0.35, 0.12, 0.0],
             "lapse_rate": 0.0065,
+            "tropopause_height_m": 11000.0,
+            "stratosphere_lapse_rate": 0.001,
+            "minimum_equilibrium_temp_k": 195.0,
             "scale_height": 8000.0,
             "scale_height_min_m": 1000.0,
             "continuity_relax": 900.0,
@@ -223,6 +234,48 @@ class Cfg(dict):
         return Cfg(v) if isinstance(v, dict) else v
 
 
+def _normalize_user_config(user):
+    """Normalize supported legacy layouts before validating user settings."""
+    if not isinstance(user, dict):
+        raise ValueError("configuration root must be a mapping")
+    user = copy.deepcopy(user)
+    data = user.get("data")
+    if isinstance(data, dict):
+        physics = user.setdefault("physics", {})
+        if not isinstance(physics, dict):
+            raise ValueError("physics must be a mapping")
+        # Older project configs accidentally placed all physics settings under
+        # data. Preserve those explicit values instead of silently falling
+        # back to DEFAULTS["physics"].
+        for key in list(data):
+            if key in DEFAULTS["physics"] or key == "drag":
+                physics.setdefault(key, data.pop(key))
+
+    physics = user.get("physics")
+    if isinstance(physics, dict) and "drag" in physics:
+        # The old generic drag was replaced by surface-specific rates. Treat
+        # it as a compatibility alias rather than accepting an ignored key.
+        drag = physics.pop("drag")
+        physics.setdefault("drag_ocean_atmosphere", drag)
+        physics.setdefault("drag_land_atmosphere", drag)
+    return user
+
+
+def _validate_user_keys(user, defaults, path=""):
+    """Reject settings that the runtime would otherwise silently ignore."""
+    for key, value in user.items():
+        dotted = f"{path}.{key}" if path else key
+        if key not in defaults:
+            raise ValueError(f"unknown configuration key: {dotted}")
+        default = defaults[key]
+        if isinstance(value, dict):
+            if not isinstance(default, dict):
+                raise ValueError(f"configuration key {dotted} is not a mapping")
+            _validate_user_keys(value, default, dotted)
+        elif isinstance(default, dict) and value is not None:
+            raise ValueError(f"configuration key {dotted} must be a mapping")
+
+
 def _merge(base, over):
     out = copy.deepcopy(base)
     for k, v in (over or {}).items():
@@ -248,4 +301,6 @@ def load_config(path=None):
     if path:
         with open(path, encoding="utf-8") as f:
             user = yaml.safe_load(f) or {}
+    user = _normalize_user_config(user)
+    _validate_user_keys(user, DEFAULTS)
     return Cfg(_merge(DEFAULTS, user))

@@ -112,3 +112,26 @@ python scripts/get_topo.py --resolution 30s
 
 `60s` is usually the practical default. `30s` is much larger. The old lightweight
 terrain can still be rebuilt with `python scripts/get_topo.py`.
+
+## Atmospheric dynamics core
+
+The default `physics.dynamics.core: primitive_equations` integrates the moist
+hydrostatic primitive equations in a terrain-following sigma coordinate:
+
+- surface pressure is prognostic and represents total atmospheric column mass;
+- layer pressure and geopotential are diagnosed from hydrostatic balance;
+- temperature includes pressure-work (`kappa T omega / p`);
+- the same interface mass flux transports heat, moisture, and momentum;
+- sigma mass flux is exactly zero at the ground and fixed-pressure model top;
+- terrain enters through surface geopotential, hydrostatic pressure reduction,
+  the transformed pressure-gradient force, and physical surface stress.
+
+The lower geometric boundary follows `w = u grad(zs)`, while its coordinate
+normal velocity is zero. Empirical mountain lift/blocking is disabled in this
+core to avoid counting terrain forcing twice. The former layered moist
+shallow-water solver is retained as
+`physics.dynamics.core: shallow_water` for comparison and compatibility.
+
+This is a hydrostatic core. It does not resolve nonhydrostatic acoustic or
+convective vertical momentum, so kilometre-scale cloud-resolving simulations
+would still require a separate nonhydrostatic dynamical core and microphysics.
