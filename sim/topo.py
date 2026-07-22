@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -85,20 +86,34 @@ def _topo_rank(path):
 
 def resolve_topo_path(spec):
     """Return the best existing topography file for a string/list spec."""
+    started = time.perf_counter()
     existing = [p for p in _candidate_paths(spec) if p.exists()]
     if not existing:
+        print(f"[startup] topography candidates resolved (none found): "
+              f"{time.perf_counter() - started:.3f}s", flush=True)
         return None
-    return str(max(existing, key=_topo_rank))
+    selected = str(max(existing, key=_topo_rank))
+    print(f"[startup] topography candidate selected "
+          f"({len(existing)} found, {selected}): "
+          f"{time.perf_counter() - started:.3f}s", flush=True)
+    return selected
 
 
 def _read_topo(path):
+    started = time.perf_counter()
     with np.load(path) as z:
-        return (np.asarray(z["topo"], dtype=np.float32),
-                np.asarray(z["lats"], dtype=np.float64),
-                np.asarray(z["lons"], dtype=np.float64))
+        result = (np.asarray(z["topo"], dtype=np.float32),
+                  np.asarray(z["lats"], dtype=np.float64),
+                  np.asarray(z["lons"], dtype=np.float64))
+    print(f"[startup] topography archive read "
+          f"({result[0].shape[0]}x{result[0].shape[1]}): "
+          f"{time.perf_counter() - started:.3f}s", flush=True)
+    return result
 
 
 def _resample_topo(topo, tlats, tlons, nlat, nlon):
+    started = time.perf_counter()
+    source_shape = topo.shape
     tlons = np.mod(np.asarray(tlons, dtype=np.float64), 360.0)
     order = np.argsort(tlons)
     tlons, uniq = np.unique(tlons[order], return_index=True)
@@ -117,7 +132,11 @@ def _resample_topo(topo, tlats, tlons, nlat, nlon):
                       for row in topo_ext], axis=0)
     elev = np.stack([np.interp(lats, tlats, along[:, j])
                      for j in range(nlon)], axis=1)
-    return elev.astype(np.float32)
+    result = elev.astype(np.float32)
+    print(f"[startup] topography resampled "
+          f"({source_shape[0]}x{source_shape[1]} -> {nlat}x{nlon}): "
+          f"{time.perf_counter() - started:.3f}s", flush=True)
+    return result
 
 
 def _procedural_topo(nlat, nlon):
@@ -130,18 +149,26 @@ def _procedural_topo(nlat, nlon):
 
 def load_topo(path, nlat, nlon):
     """Return ``(elev[nlat,nlon], land_mask[nlat,nlon])``."""
+    started = time.perf_counter()
     resolved = resolve_topo_path(path)
     if resolved:
         topo, tlats, tlons = _read_topo(resolved)
         elev = _resample_topo(topo, tlats, tlons, nlat, nlon)
-        return elev, (elev > 0).astype(np.float32)
+        result = elev, (elev > 0).astype(np.float32)
+        print(f"[startup] topography load complete: "
+              f"{time.perf_counter() - started:.3f}s", flush=True)
+        return result
 
     elev = _procedural_topo(nlat, nlon)
-    return elev, (elev > 0).astype(np.float32)
+    result = elev, (elev > 0).astype(np.float32)
+    print(f"[startup] procedural topography generated: "
+          f"{time.perf_counter() - started:.3f}s", flush=True)
+    return result
 
 
 def make_base_texture(topo_path, out_png, width=1080):
     """Create the UI base-map PNG from the best available terrain file."""
+    started = time.perf_counter()
     from PIL import Image
 
     resolved = resolve_topo_path(topo_path)
@@ -174,4 +201,6 @@ def make_base_texture(topo_path, out_png, width=1080):
     img = (np.clip(img, 0, 1)[::-1] * 255).astype(np.uint8)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     Image.fromarray(img).save(out_png)
+    print(f"[startup] basemap texture written ({w}x{h}): "
+          f"{time.perf_counter() - started:.3f}s", flush=True)
     return out_png

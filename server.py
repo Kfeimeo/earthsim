@@ -9,6 +9,7 @@ import datetime as dt
 import json
 import os
 import struct
+import time
 
 import numpy as np
 
@@ -65,7 +66,10 @@ class LiveRecorder:
             json.dump(manifest, fp, ensure_ascii=False, indent=1)
 
     def start(self, model):
+        started = time.perf_counter()
         self.run_dir = self._new_run_dir()
+        print(f"[startup] recording directory created: "
+              f"{time.perf_counter() - started:.3f}s", flush=True)
         self.frame_count = 0
         self.times = []
         self.save(model, force=True)
@@ -78,16 +82,30 @@ class LiveRecorder:
             return True
         if not force and model.step_count % self.every_steps:
             return False
+        stage_started = time.perf_counter()
         fields = model.fields_cpu(include_layers=True)
         fields = {name: np.asarray(value, dtype=np.float32)
                   for name, value in fields.items()}
         fields["subsolar"] = np.asarray(model.subsolar, dtype=np.float32)
+        if force:
+            print(f"[startup] initial recording fields prepared: "
+                  f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         path = os.path.join(self.run_dir, "frames",
                             f"frame_{self.frame_count:06d}.npz")
+        stage_started = time.perf_counter()
         np.savez_compressed(path, **fields)
+        if force:
+            size_mib = os.path.getsize(path) / (1024 * 1024)
+            print(f"[startup] initial recording compressed and written "
+                  f"({size_mib:.1f} MiB): "
+                  f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         self.times.append(model.t.isoformat())
         self.frame_count += 1
+        stage_started = time.perf_counter()
         self._write_manifest(model)
+        if force:
+            print(f"[startup] recording manifest written: "
+                  f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         return True
 
     def set_enabled(self, enabled, model):
@@ -129,18 +147,36 @@ class Hub:
             self._reset_live_state(start_recording=True)
 
     def _reset_live_state(self, start_recording=False):
+        reset_started = time.perf_counter()
+        stage_started = time.perf_counter()
         self.model = EarthModel(self.cfg)
+        print(f"[startup] EarthModel created: "
+              f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         if self.cfg.time.spinup_days:
             n = int(self.cfg.time.spinup_days * 86400 / self.model.dt)
             print(f"[server] spin-up {self.cfg.time.spinup_days} 天 ({n} 步)...")
+            stage_started = time.perf_counter()
             self.model.step(n)
+            print(f"[startup] model spin-up ({n} steps): "
+                  f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         self.lats, self.lons = self.model.lats, self.model.lons
+        stage_started = time.perf_counter()
         self.land = to_cpu(self.model.land)
+        print(f"[startup] land mask copied to CPU: "
+              f"{time.perf_counter() - stage_started:.3f}s", flush=True)
+        stage_started = time.perf_counter()
         self.fields = self.model.fields_cpu()
+        print(f"[startup] initial display fields copied to CPU: "
+              f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         self.time_iso = self.model.t.isoformat()
         if self.recorder and self.recorder.enabled:
             if start_recording or self.recorder.run_dir is None:
+                stage_started = time.perf_counter()
                 self.recorder.start(self.model)
+                print(f"[startup] initial recording completed: "
+                      f"{time.perf_counter() - stage_started:.3f}s", flush=True)
+        print(f"[startup] live state initialized: "
+              f"{time.perf_counter() - reset_started:.3f}s", flush=True)
 
     # -------- 推进 --------
     def _advance(self, nsteps=None):
@@ -366,14 +402,22 @@ class Hub:
 
 
 def create_app(cfg, playback_dir=None):
+    create_started = time.perf_counter()
+    stage_started = time.perf_counter()
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
+    print(f"[startup] FastAPI modules imported: "
+          f"{time.perf_counter() - stage_started:.3f}s", flush=True)
 
+    stage_started = time.perf_counter()
     hub = Hub(cfg, playback_dir)
+    print(f"[startup] simulation hub created ({hub.mode}): "
+          f"{time.perf_counter() - stage_started:.3f}s", flush=True)
     app = FastAPI(title="EarthSim")
     app.state.hub = hub
 
+    stage_started = time.perf_counter()
     base_png = os.path.join(ROOT, "web", "generated", "base.png")
     base_width = int(getattr(cfg.server, "basemap_width", 2160))
     needs_basemap = not os.path.exists(base_png)
@@ -381,10 +425,16 @@ def create_app(cfg, playback_dir=None):
         from PIL import Image
         with Image.open(base_png) as image:
             needs_basemap = image.width != base_width
+    print(f"[startup] basemap cache checked "
+          f"({'miss' if needs_basemap else 'hit'}): "
+          f"{time.perf_counter() - stage_started:.3f}s", flush=True)
     if needs_basemap:
         print("[server] 生成地形底图...")
         topo_spec = cfg.grid.get("topo_files", cfg.grid.get("topo_file", ""))
+        stage_started = time.perf_counter()
         _topo.make_base_texture(topo_spec, base_png, width=base_width)
+        print(f"[startup] basemap generated: "
+              f"{time.perf_counter() - stage_started:.3f}s", flush=True)
 
     @app.on_event("startup")
     async def _start():
@@ -446,4 +496,6 @@ def create_app(cfg, playback_dir=None):
 
     app.mount("/static", StaticFiles(directory=os.path.join(ROOT, "web")),
               name="static")
+    print(f"[startup] FastAPI routes registered; create_app complete: "
+          f"{time.perf_counter() - create_started:.3f}s", flush=True)
     return app

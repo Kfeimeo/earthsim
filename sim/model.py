@@ -1,6 +1,7 @@
 """EarthModel: 状态管理 + 时间积分。"""
 import datetime as _dt
 import numpy as _np
+import time as _time
 
 from . import topo as _topo
 from .backend import init_backend, to_cpu
@@ -11,32 +12,56 @@ from .physics import (Ops, qsat, insolation, A_EARTH,
 
 class EarthModel:
     def __init__(self, cfg):
+        init_started = _time.perf_counter()
         self.cfg = cfg
+        stage_started = _time.perf_counter()
         self.xp, self.backend = init_backend(cfg.backend)
+        print(f"[startup] backend initialized ({self.backend}): "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         xp = self.xp
         g = cfg.grid
         self.nlat, self.nlon = int(g.nlat), int(g.nlon)
         self.lats, self.lons = _topo.sim_grid(self.nlat, self.nlon)
         topo_spec = g.get("topo_files", g.get("topo_file", ""))
+        stage_started = _time.perf_counter()
         elev, land = _topo.load_topo(topo_spec, self.nlat, self.nlon)
+        print(f"[startup] model topography ready ({self.nlat}x{self.nlon}): "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
+        stage_started = _time.perf_counter()
         self.elev = xp.asarray(elev)
         self.land = xp.asarray(land)          # 1=陆地
         self.ocean = 1.0 - self.land
+        print(f"[startup] topography copied to {self.backend}: "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         n = cfg.numerics
+        stage_started = _time.perf_counter()
         self.ops = Ops(xp, self.lats, self.nlon,
                        cos_clamp=n.cos_clamp, pf_lat=n.polar_filter_lat,
                        pf_passes=int(n.polar_filter_passes),
                        use_cuda_kernel=(self.backend == "cuda"),
                        lons_deg=self.lons)
+        print(f"[startup] numerical operators initialized: "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         self.dt = float(cfg.time.dt)
         self.t = _dt.datetime.fromisoformat(str(cfg.time.start))
         self.step_count = 0
         _, d0, l0 = insolation(self.xp, self.ops.lat, self.ops.lon_rad, self.t,
                                cfg.physics.S0, cfg.physics.diurnal_cycle)
         self.subsolar = (float(d0), float(l0))
+        stage_started = _time.perf_counter()
         self._init_vertical_grid()
+        print(f"[startup] vertical grid initialized ({self.nz} levels): "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
+        stage_started = _time.perf_counter()
         self._init_terrain_dynamics()
+        print(f"[startup] terrain dynamics initialized: "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
+        stage_started = _time.perf_counter()
         self._init_state()
+        print(f"[startup] model state initialized ({self.initialization_source}): "
+              f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
+        print(f"[startup] EarthModel initialization complete: "
+              f"{_time.perf_counter() - init_started:.3f}s", flush=True)
 
     # ------------------------------------------------------------
     def _init_vertical_grid(self):

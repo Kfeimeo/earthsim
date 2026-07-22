@@ -6,20 +6,20 @@
 backend: cuda            # auto | cuda | cpu
 
 grid:
-  nlat: 1800              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
-  nlon: 3600             # usually nlat*2
+  nlat: 720              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
+  nlon: 1440             # usually nlat*2
   topo_file: data/etopo2022_60s.npz
   topo_files:
     - data/etopo2022_60s.npz
     - data/etopo20.npz
 
 time:
-  dt: 30
+  dt: 10
   start: "2026-05-01T00:00:00"
   spinup_days: 0
 
 data:
-  init_mode: real       # ideal | auto | real
+  init_mode: ideal       # ideal | auto | real
   atmosphere_file: data/era5_pressure_levels.nc
   surface_file: data/era5_single_levels.nc
   ocean_file: data/cmems_surface_currents.nc
@@ -108,7 +108,7 @@ physics:
     wave_phase: 0.8
 
   initial_conditions:
-    equilibrium_temp_base_k: 288.0
+    equilibrium_temp_base_k: 308.0
     equilibrium_temp_pole_delta_k: 42.0
     surface_lapse_rate: 0.0065
     humidity_decay_height_m: 4500.0
@@ -118,7 +118,7 @@ physics:
     temp_wave_lon2: 5.0
     temp_wave_phase2: -1.3
     temp_wave_decay_height_m: 7000.0
-    real_default_temp_k: 280.0
+    real_default_temp_k: 290.0
     real_default_humidity: 0.01
     real_default_mslp_hpa: 1013.0
 
@@ -257,7 +257,7 @@ precompute:
 server:
   host: 0.0.0.0
   port: 8000
-  steps_per_frame: 10
+  steps_per_frame: 3
   max_fps: 60
   vector_stride: 5
   basemap_width: 2160
