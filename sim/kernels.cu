@@ -22,6 +22,42 @@ __device__ __forceinline__ float load_clamped_wrapped(
     return F[base + clampi(i, nlat) * nlon + wrap(j, nlon)];
 }
 
+__device__ __forceinline__ float tvd_slope(
+    float backward, float forward, int limiter)
+{
+    if (backward * forward <= 0.0f) return 0.0f;
+    if (limiter == 0) {  // minmod
+        return copysignf(fminf(fabsf(backward), fabsf(forward)), backward);
+    }
+    if (limiter == 1) {  // van Leer
+        return 2.0f * backward * forward / (backward + forward);
+    }
+    // monotonized central (MC)
+    float centred = 0.5f * (backward + forward);
+    float magnitude = fminf(fabsf(centred),
+                            fminf(2.0f * fabsf(backward),
+                                  2.0f * fabsf(forward)));
+    return copysignf(magnitude, centred);
+}
+
+__device__ __forceinline__ float slope_x_at(
+    const float* F, int base, int i, int j, int nlat, int nlon, int limiter)
+{
+    float west = load_clamped_wrapped(F, base, i, j - 1, nlat, nlon);
+    float centre = load_clamped_wrapped(F, base, i, j, nlat, nlon);
+    float east = load_clamped_wrapped(F, base, i, j + 1, nlat, nlon);
+    return tvd_slope(centre - west, east - centre, limiter);
+}
+
+__device__ __forceinline__ float slope_y_at(
+    const float* F, int base, int i, int j, int nlat, int nlon, int limiter)
+{
+    float south = load_clamped_wrapped(F, base, i - 1, j, nlat, nlon);
+    float centre = load_clamped_wrapped(F, base, i, j, nlat, nlon);
+    float north = load_clamped_wrapped(F, base, i + 1, j, nlat, nlon);
+    return tvd_slope(centre - south, north - centre, limiter);
+}
+
 // F += dt * (-u dF/dx - v dF/dy + K * lap(F)).
 // The Python wrapper launches one 16x16 grid per leading-dimension plane.
 __global__ void adv_diff(
@@ -306,6 +342,158 @@ __global__ void polar_filter(
         float original = F[base + j];
         out[base + j] = original + weight * (current[j] - original);
     }
+}
+
+// Second-order-in-space MUSCL/TVD transport of an advected scalar.  Face
+// fluxes use centred velocities and limited left/right reconstructed states.
+__global__ void muscl_adv_diff(
+    const float* __restrict__ F,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ invdx,
+    const float* __restrict__ coslat,
+    const float* __restrict__ invcoslat,
+    float invdy, float K, float dt, int limiter,
+    float* __restrict__ out,
+    int nlat, int nlon)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int plane = blockIdx.z;
+    if (i >= nlat || j >= nlon) return;
+
+    int cells = nlat * nlon;
+    int base = plane * cells;
+    int west = j == 0 ? nlon - 1 : j - 1;
+    int east = j + 1 == nlon ? 0 : j + 1;
+    int south = i == 0 ? 0 : i - 1;
+    int north = i + 1 == nlat ? nlat - 1 : i + 1;
+    int idx = base + i * nlon + j;
+    int idx_w = base + i * nlon + west;
+    int idx_e = base + i * nlon + east;
+    int idx_s = base + south * nlon + j;
+    int idx_n = base + north * nlon + j;
+
+    float f = F[idx], fw = F[idx_w], fe = F[idx_e];
+    float fs = F[idx_s], fn = F[idx_n];
+    float sx = slope_x_at(F, base, i, j, nlat, nlon, limiter);
+    float sx_w = slope_x_at(F, base, i, j - 1, nlat, nlon, limiter);
+    float sx_e = slope_x_at(F, base, i, j + 1, nlat, nlon, limiter);
+    float sy = slope_y_at(F, base, i, j, nlat, nlon, limiter);
+    float sy_s = slope_y_at(F, base, i - 1, j, nlat, nlon, limiter);
+    float sy_n = slope_y_at(F, base, i + 1, j, nlat, nlon, limiter);
+
+    float ue = 0.5f * (u[idx] + u[idx_e]);
+    float uw = 0.5f * (u[idx_w] + u[idx]);
+    float state_e = ue >= 0.0f ? f + 0.5f * sx : fe - 0.5f * sx_e;
+    float state_w = uw >= 0.0f ? fw + 0.5f * sx_w : f - 0.5f * sx;
+
+    float vn = i + 1 < nlat
+        ? 0.5f * (v[idx] * coslat[i] + v[idx_n] * coslat[north]) : 0.0f;
+    float vs = i > 0
+        ? 0.5f * (v[idx_s] * coslat[south] + v[idx] * coslat[i]) : 0.0f;
+    float state_n = vn >= 0.0f ? f + 0.5f * sy : fn - 0.5f * sy_n;
+    float state_s = vs >= 0.0f ? fs + 0.5f * sy_s : f - 0.5f * sy;
+
+    float scalar_div = (ue * state_e - uw * state_w) * invdx[i]
+        + (vn * state_n - vs * state_s) * invdy * invcoslat[i];
+    float velocity_div = (ue - uw) * invdx[i]
+        + (vn - vs) * invdy * invcoslat[i];
+    float lap = (fw + fe - 2.0f * f) * invdx[i] * invdx[i]
+              + (fn + fs - 2.0f * f) * invdy * invdy;
+    out[idx] = f + dt * (-scalar_div + f * velocity_div + K * lap);
+}
+
+// Mass-consistent MUSCL/TVD transport in terrain-following sigma layers.
+__global__ void muscl_mass_transport(
+    const float* __restrict__ field,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ mu_old,
+    const float* __restrict__ mu_new,
+    const float* __restrict__ sigma_thickness,
+    const float* __restrict__ div_mass,
+    const float* __restrict__ interface_flux,
+    const float* __restrict__ invdx,
+    const float* __restrict__ coslat,
+    const float* __restrict__ invcoslat,
+    float invdy, float diffusivity, float dt, int limiter,
+    float* __restrict__ out,
+    int nz, int nlat, int nlon)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z;
+    if (k >= nz || i >= nlat || j >= nlon) return;
+
+    int cells = nlat * nlon;
+    int base = k * cells;
+    int col = i * nlon + j;
+    int west = j == 0 ? nlon - 1 : j - 1;
+    int east = j + 1 == nlon ? 0 : j + 1;
+    int south = i == 0 ? 0 : i - 1;
+    int north = i + 1 == nlat ? nlat - 1 : i + 1;
+    int col_w = i * nlon + west;
+    int col_e = i * nlon + east;
+    int col_s = south * nlon + j;
+    int col_n = north * nlon + j;
+    int idx = base + col;
+    int idx_w = base + col_w;
+    int idx_e = base + col_e;
+    int idx_s = base + col_s;
+    int idx_n = base + col_n;
+
+    float f = field[idx], fw = field[idx_w], fe = field[idx_e];
+    float fs = field[idx_s], fn = field[idx_n];
+    float sx = slope_x_at(field, base, i, j, nlat, nlon, limiter);
+    float sx_w = slope_x_at(field, base, i, j - 1, nlat, nlon, limiter);
+    float sx_e = slope_x_at(field, base, i, j + 1, nlat, nlon, limiter);
+    float sy = slope_y_at(field, base, i, j, nlat, nlon, limiter);
+    float sy_s = slope_y_at(field, base, i - 1, j, nlat, nlon, limiter);
+    float sy_n = slope_y_at(field, base, i + 1, j, nlat, nlon, limiter);
+
+    float mass_e = 0.5f * (mu_old[col] * u[idx]
+                            + mu_old[col_e] * u[idx_e]);
+    float mass_w = 0.5f * (mu_old[col_w] * u[idx_w]
+                            + mu_old[col] * u[idx]);
+    float state_e = mass_e >= 0.0f ? f + 0.5f * sx : fe - 0.5f * sx_e;
+    float state_w = mass_w >= 0.0f ? fw + 0.5f * sx_w : f - 0.5f * sx;
+
+    float mass_n = i + 1 < nlat
+        ? 0.5f * (mu_old[col] * v[idx] * coslat[i]
+                  + mu_old[col_n] * v[idx_n] * coslat[north]) : 0.0f;
+    float mass_s = i > 0
+        ? 0.5f * (mu_old[col_s] * v[idx_s] * coslat[south]
+                  + mu_old[col] * v[idx] * coslat[i]) : 0.0f;
+    float state_n = mass_n >= 0.0f ? f + 0.5f * sy : fn - 0.5f * sy_n;
+    float state_s = mass_s >= 0.0f ? fs + 0.5f * sy_s : f - 0.5f * sy;
+
+    float scalar_div = (mass_e * state_e - mass_w * state_w) * invdx[i]
+        + (mass_n * state_n - mass_s * state_s) * invdy * invcoslat[i];
+    float face_mass_div = (mass_e - mass_w) * invdx[i]
+        + (mass_n - mass_s) * invdy * invcoslat[i];
+    float ds = sigma_thickness[k];
+    float numerator = mu_old[col] * ds * f + dt * ds
+        * (-f * div_mass[idx] - scalar_div + f * face_mass_div);
+
+    if (k < nz - 1) {
+        float flux = interface_flux[(k + 1) * cells + col];
+        float upstream = flux >= 0.0f ? field[idx + cells] : f;
+        numerator += dt * flux * upstream;
+    }
+    if (k > 0) {
+        float flux = interface_flux[k * cells + col];
+        float upstream = flux >= 0.0f ? f : field[idx - cells];
+        numerator -= dt * flux * upstream;
+    }
+
+    float result = numerator / fmaxf(mu_new[col] * ds, 1.0f);
+    if (diffusivity != 0.0f) {
+        float lap = (fw + fe - 2.0f * f) * invdx[i] * invdx[i]
+                  + (fn + fs - 2.0f * f) * invdy * invdy;
+        result += dt * diffusivity * lap;
+    }
+    out[idx] = result;
 }
 
 #undef ADV_BLOCK_X

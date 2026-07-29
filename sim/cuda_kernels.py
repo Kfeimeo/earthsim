@@ -3,9 +3,11 @@ import os
 
 _module = None
 _adv_diff = None
+_muscl_adv_diff = None
 _gradient = None
 _divergence = None
 _mass_transport = None
+_muscl_mass_transport = None
 _hydrostatic_column = None
 _polar_filter = None
 _ADV_BLOCK = (16, 16)  # Must match the static shared-memory tile in kernels.cu.
@@ -13,8 +15,9 @@ _POLAR_BLOCK = (256,)
 
 
 def load():
-    global _module, _adv_diff, _gradient, _divergence
-    global _mass_transport, _hydrostatic_column, _polar_filter
+    global _module, _adv_diff, _muscl_adv_diff, _gradient, _divergence
+    global _mass_transport, _muscl_mass_transport
+    global _hydrostatic_column, _polar_filter
     if _module is not None:
         return True
     try:
@@ -24,9 +27,11 @@ def load():
             src = source_file.read()
         _module = cp.RawModule(code=src, options=("--use_fast_math",))
         _adv_diff = _module.get_function("adv_diff")
+        _muscl_adv_diff = _module.get_function("muscl_adv_diff")
         _gradient = _module.get_function("gradient")
         _divergence = _module.get_function("divergence")
         _mass_transport = _module.get_function("mass_transport")
+        _muscl_mass_transport = _module.get_function("muscl_mass_transport")
         _hydrostatic_column = _module.get_function("hydrostatic_column")
         _polar_filter = _module.get_function("polar_filter")
         return True
@@ -35,7 +40,16 @@ def load():
         return False
 
 
-def adv_diff(F, u, v, invdx, invdy, K, dt):
+def _limiter_code(limiter):
+    codes = {"minmod": 0, "vanleer": 1, "mc": 2}
+    try:
+        return codes[str(limiter).lower()]
+    except KeyError as exc:
+        raise ValueError(f"unsupported MUSCL limiter: {limiter}") from exc
+
+
+def adv_diff(F, u, v, invdx, invdy, K, dt, scheme="upwind",
+             limiter="mc", coslat=None, invcoslat=None):
     """返回批量平流扩散结果；末两维为 (nlat, nlon)。"""
     import cupy as cp
     if F.ndim < 2:
@@ -58,9 +72,23 @@ def adv_diff(F, u, v, invdx, invdy, K, dt):
     grid = ((nlon + block[0] - 1) // block[0],
             (nlat + block[1] - 1) // block[1],
             planes)
-    _adv_diff(grid, block,
-              (F, u, v, invdx, cp.float32(invdy), cp.float32(K),
-               cp.float32(dt), out, cp.int32(nlat), cp.int32(nlon)))
+    if str(scheme).lower() == "muscl_tvd":
+        if coslat is None or invcoslat is None:
+            raise ValueError("MUSCL transport requires latitude metrics")
+        coslat = cp.ascontiguousarray(coslat, dtype=cp.float32)
+        invcoslat = cp.ascontiguousarray(invcoslat, dtype=cp.float32)
+        if coslat.size != nlat or invcoslat.size != nlat:
+            raise ValueError("latitude metric arrays must match the field")
+        _muscl_adv_diff(
+            grid, block,
+            (F, u, v, invdx, coslat, invcoslat, cp.float32(invdy),
+             cp.float32(K), cp.float32(dt),
+             cp.int32(_limiter_code(limiter)), out,
+             cp.int32(nlat), cp.int32(nlon)))
+    else:
+        _adv_diff(grid, block,
+                  (F, u, v, invdx, cp.float32(invdy), cp.float32(K),
+                   cp.float32(dt), out, cp.int32(nlat), cp.int32(nlon)))
     return out
 
 
@@ -114,7 +142,8 @@ def divergence(u, v, invdx, invdy, coslat, invcoslat):
 
 def mass_transport(field, u, v, mu_old, mu_new, sigma_thickness,
                    div_mass, interface_flux, invdx, invdy,
-                   diffusivity, dt):
+                   diffusivity, dt, scheme="upwind", limiter="mc",
+                   coslat=None, invcoslat=None):
     """Flux-form horizontal/vertical transport for a batched 3-D field."""
     import cupy as cp
     field, nlat, nlon, block, grid = _field_layout(cp, field)
@@ -145,12 +174,27 @@ def mass_transport(field, u, v, mu_old, mu_new, sigma_thickness,
         raise ValueError("transport metric arrays do not match the field")
 
     out = cp.empty_like(field)
-    _mass_transport(
-        grid, block,
-        (field, u, v, mu_old, mu_new, sigma_thickness,
-         div_mass, interface_flux, invdx, cp.float32(invdy),
-         cp.float32(diffusivity), cp.float32(dt), out,
-         cp.int32(nz), cp.int32(nlat), cp.int32(nlon)))
+    if str(scheme).lower() == "muscl_tvd":
+        if coslat is None or invcoslat is None:
+            raise ValueError("MUSCL mass transport requires latitude metrics")
+        coslat = cp.ascontiguousarray(coslat, dtype=cp.float32)
+        invcoslat = cp.ascontiguousarray(invcoslat, dtype=cp.float32)
+        if coslat.size != nlat or invcoslat.size != nlat:
+            raise ValueError("latitude metric arrays must match the field")
+        _muscl_mass_transport(
+            grid, block,
+            (field, u, v, mu_old, mu_new, sigma_thickness,
+             div_mass, interface_flux, invdx, coslat, invcoslat,
+             cp.float32(invdy), cp.float32(diffusivity), cp.float32(dt),
+             cp.int32(_limiter_code(limiter)), out,
+             cp.int32(nz), cp.int32(nlat), cp.int32(nlon)))
+    else:
+        _mass_transport(
+            grid, block,
+            (field, u, v, mu_old, mu_new, sigma_thickness,
+             div_mass, interface_flux, invdx, cp.float32(invdy),
+             cp.float32(diffusivity), cp.float32(dt), out,
+             cp.int32(nz), cp.int32(nlat), cp.int32(nlon)))
     return out
 
 

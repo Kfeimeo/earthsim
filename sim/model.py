@@ -39,15 +39,23 @@ class EarthModel:
               f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         n = cfg.numerics
         self.advection_scheme = str(n.advection).lower()
-        if self.advection_scheme != "upwind":
+        if self.advection_scheme in {"muscl", "tvd"}:
+            self.advection_scheme = "muscl_tvd"
+        if self.advection_scheme not in {"upwind", "muscl_tvd"}:
             raise ValueError(
-                "numerics.advection currently supports only 'upwind'")
+                "numerics.advection must be 'upwind' or 'muscl_tvd'")
+        self.advection_limiter = str(n.get("advection_limiter", "mc")).lower()
+        if self.advection_limiter not in {"minmod", "vanleer", "mc"}:
+            raise ValueError(
+                "numerics.advection_limiter must be minmod, vanleer, or mc")
         stage_started = _time.perf_counter()
         self.ops = Ops(xp, self.lats, self.nlon,
                        cos_clamp=n.cos_clamp, pf_lat=n.polar_filter_lat,
                        pf_passes=int(n.polar_filter_passes),
                        use_cuda_kernel=(self.backend == "cuda"),
-                       lons_deg=self.lons)
+                       lons_deg=self.lons,
+                       advection_scheme=self.advection_scheme,
+                       advection_limiter=self.advection_limiter)
         print(f"[startup] numerical operators initialized: "
               f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         self.dt = float(cfg.time.dt)

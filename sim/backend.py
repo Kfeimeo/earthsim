@@ -1,7 +1,7 @@
 """后端选择: CUDA (CuPy) 或 CPU (NumPy)。
 
 物理代码全部用数组算子编写, 在两种后端下运行同一份代码;
-GPU 下热点(迎风平流)另有手写 CUDA kernel (kernels.cu) 融合加速。
+GPU 下热点平流另有手写 CUDA kernel (kernels.cu) 融合加速。
 """
 import numpy as np
 

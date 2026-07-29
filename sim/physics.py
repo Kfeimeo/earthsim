@@ -35,7 +35,8 @@ class Ops:
 
     def __init__(self, xp, lats_deg, nlon, cos_clamp=0.2,
                  pf_lat=65.0, pf_passes=6, use_cuda_kernel=False,
-                 lons_deg=None):
+                 lons_deg=None, advection_scheme="upwind",
+                 advection_limiter="mc"):
         self.xp = xp
         nlat = len(lats_deg)
         self.nlat, self.nlon = nlat, nlon
@@ -56,6 +57,11 @@ class Ops:
         self.invdy = _np.float32(1.0 / self.dy)
         self.f = (2 * OMEGA * xp.sin(lat)).astype(xp.float32)
         self.tanl = xp.clip(xp.tan(lat), -3.0, 3.0).astype(xp.float32) / A_EARTH
+        self.advection_scheme = str(advection_scheme).lower()
+        self.advection_limiter = str(advection_limiter).lower()
+        north_face_mask = _np.ones((nlat, 1), dtype=_np.float32)
+        north_face_mask[-1] = 0.0
+        self.north_face_mask = xp.asarray(north_face_mask)
         # 极区纬向滤波权重
         absd = _np.abs(lats_deg)
         w = _np.clip((absd - pf_lat) / (89.0 - pf_lat), 0, 1) ** 2
@@ -121,17 +127,105 @@ class Ops:
         dyp = (self.shifty(F, -1) - F) * self.invdy
         return -(u * xp.where(u > 0, dxm, dxp) + v * xp.where(v > 0, dym, dyp))
 
+    def _limited_slope(self, backward, forward):
+        """Return a TVD-limited, dimensionless cell slope."""
+        xp = self.xp
+        same_sign = backward * forward > 0.0
+        if self.advection_limiter == "minmod":
+            magnitude = xp.minimum(xp.abs(backward), xp.abs(forward))
+            return xp.where(same_sign, xp.sign(backward) * magnitude, 0.0)
+        if self.advection_limiter == "vanleer":
+            denominator = backward + forward
+            slope = 2.0 * backward * forward / xp.where(
+                xp.abs(denominator) > 1.0e-30, denominator, 1.0)
+            return xp.where(same_sign, slope, 0.0)
+        if self.advection_limiter == "mc":
+            centred = 0.5 * (backward + forward)
+            magnitude = xp.minimum(
+                xp.abs(centred),
+                xp.minimum(2.0 * xp.abs(backward),
+                           2.0 * xp.abs(forward)))
+            return xp.where(same_sign, xp.sign(centred) * magnitude, 0.0)
+        raise ValueError(
+            f"unsupported MUSCL limiter: {self.advection_limiter}")
+
+    def finite_volume_divergence(self, flux_u, flux_v):
+        """Spherical control-volume divergence from centred face fluxes."""
+        xp = self.xp
+        east_face = 0.5 * (flux_u + self.rollx(flux_u, -1))
+        west_face = self.rollx(east_face, 1)
+
+        weighted_v = flux_v * self.coslat
+        north_face = 0.5 * (
+            weighted_v + self.shifty(weighted_v, -1))
+        north_face = north_face * self.north_face_mask
+        south_face = xp.concatenate(
+            [xp.zeros_like(north_face[..., :1, :]),
+             north_face[..., :-1, :]], axis=-2)
+        return ((east_face - west_face) * self.invdx
+                + (north_face - south_face) * self.invdy * self.invcoslat)
+
+    def muscl_flux_divergence(self, F, flux_u, flux_v):
+        """Divergence of ``flux * F`` using MUSCL/TVD face states."""
+        xp = self.xp
+
+        west = self.rollx(F, 1)
+        east = self.rollx(F, -1)
+        slope_x = self._limited_slope(F - west, east - F)
+        slope_east = self.rollx(slope_x, -1)
+        flux_east = 0.5 * (flux_u + self.rollx(flux_u, -1))
+        state_east = xp.where(
+            flux_east >= 0.0,
+            F + 0.5 * slope_x,
+            east - 0.5 * slope_east)
+        transported_east = flux_east * state_east
+        transported_west = self.rollx(transported_east, 1)
+
+        south = self.shifty(F, 1)
+        north = self.shifty(F, -1)
+        slope_y = self._limited_slope(F - south, north - F)
+        slope_north = self.shifty(slope_y, -1)
+        weighted_v = flux_v * self.coslat
+        flux_north = 0.5 * (
+            weighted_v + self.shifty(weighted_v, -1))
+        flux_north = flux_north * self.north_face_mask
+        state_north = xp.where(
+            flux_north >= 0.0,
+            F + 0.5 * slope_y,
+            north - 0.5 * slope_north)
+        transported_north = flux_north * state_north
+        transported_south = xp.concatenate(
+            [xp.zeros_like(transported_north[..., :1, :]),
+             transported_north[..., :-1, :]], axis=-2)
+
+        return ((transported_east - transported_west) * self.invdx
+                + (transported_north - transported_south)
+                * self.invdy * self.invcoslat)
+
+    def muscl_adv(self, F, u, v):
+        """MUSCL/TVD approximation of the advective tendency ``-V.grad(F)``."""
+        return (-self.muscl_flux_divergence(F, u, v)
+                + F * self.finite_volume_divergence(u, v))
+
     def adv_diff_step(self, F, u, v, K, dt):
         """F += dt*(adv + K lap)。GPU 下走手写 CUDA kernel。"""
         if self.cuda_adv is not None:
-            return self.cuda_adv.adv_diff(F, u, v, self.invdx_flat,
-                                          float(self.invdy), float(K), float(dt))
+            return self.cuda_adv.adv_diff(
+                F, u, v, self.invdx_flat, float(self.invdy), float(K),
+                float(dt), scheme=self.advection_scheme,
+                limiter=self.advection_limiter,
+                coslat=self.coslat_flat,
+                invcoslat=self.invcoslat_flat)
         if F.ndim > 2:
             return self.xp.stack([
                 self.adv_diff_step(Fk, uk, vk, K, dt)
                 for Fk, uk, vk in zip(F, u, v)
             ], axis=0)
-        return F + dt * (self.upwind_adv(F, u, v) + K * self.lap(F))
+        if self.advection_scheme == "muscl_tvd":
+            advective = self.muscl_adv(F, u, v)
+        else:
+            advective = self.upwind_adv(F, u, v)
+        return F + dt * (advective + K * self.lap(F))
 
     def polar_filter(self, F):
         """高纬纬向 1-2-1 平滑, 抑制极点数值噪声。"""

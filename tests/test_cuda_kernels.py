@@ -173,6 +173,69 @@ class CudaKernelTests(unittest.TestCase):
         np.testing.assert_allclose(
             self.cp.asnumpy(actual), expected, rtol=4e-6, atol=4e-5)
 
+    def test_muscl_transport_matches_numpy(self):
+        from sim.physics import Ops
+        from sim.primitive import mass_consistent_transport
+
+        rng = np.random.default_rng(23)
+        nz, nlat, nlon = 3, 17, 35
+        lats = np.linspace(-85.0, 85.0, nlat, dtype=np.float32)
+        ops = Ops(
+            np, lats, nlon, cos_clamp=0.2,
+            advection_scheme="muscl_tvd", advection_limiter="mc")
+        shape = (nz, nlat, nlon)
+        field = rng.uniform(0.0, 1.0, size=shape).astype(np.float32)
+        u = rng.normal(0.0, 8.0, size=shape).astype(np.float32)
+        v = rng.normal(0.0, 8.0, size=shape).astype(np.float32)
+        mu_old = rng.uniform(75000.0, 95000.0, size=(nlat, nlon)).astype(
+            np.float32)
+        mu_new = (mu_old + rng.normal(
+            0.0, 10.0, size=(nlat, nlon))).astype(np.float32)
+        sigma = np.array([0.2, 0.3, 0.5], np.float32)
+        mass_u = mu_old[None, :, :] * u
+        mass_v = mu_old[None, :, :] * v
+        div_mass = ops.finite_volume_divergence(mass_u, mass_v)
+        interface_flux = np.zeros((nz + 1, nlat, nlon), np.float32)
+        interface_flux[1:-1] = rng.normal(
+            0.0, 0.01, size=(nz - 1, nlat, nlon)).astype(np.float32)
+
+        expected = mass_consistent_transport(
+            np, ops, field, u, v, mu_old, mu_new, sigma, div_mass,
+            interface_flux, 0.0, 10.0)
+        actual = self.kernels.mass_transport(
+            self.cp.asarray(field), self.cp.asarray(u), self.cp.asarray(v),
+            self.cp.asarray(mu_old), self.cp.asarray(mu_new),
+            self.cp.asarray(sigma), self.cp.asarray(div_mass),
+            self.cp.asarray(interface_flux),
+            self.cp.asarray(ops.invdx[:, 0]), ops.invdy, 0.0, 10.0,
+            scheme="muscl_tvd", limiter="mc",
+            coslat=self.cp.asarray(ops.coslat[:, 0]),
+            invcoslat=self.cp.asarray(ops.invcoslat[:, 0]))
+        np.testing.assert_allclose(
+            self.cp.asnumpy(actual), expected, rtol=8e-6, atol=8e-6)
+
+    def test_muscl_adv_diff_matches_numpy(self):
+        from sim.physics import Ops
+
+        rng = np.random.default_rng(29)
+        nlat, nlon = 17, 35
+        lats = np.linspace(-85.0, 85.0, nlat, dtype=np.float32)
+        ops = Ops(
+            np, lats, nlon, cos_clamp=0.2,
+            advection_scheme="muscl_tvd", advection_limiter="vanleer")
+        field = rng.normal(size=(2, nlat, nlon)).astype(np.float32)
+        u = rng.normal(0.0, 7.0, size=field.shape).astype(np.float32)
+        v = rng.normal(0.0, 7.0, size=field.shape).astype(np.float32)
+        expected = ops.adv_diff_step(field, u, v, 50.0, 12.0)
+        actual = self.kernels.adv_diff(
+            self.cp.asarray(field), self.cp.asarray(u), self.cp.asarray(v),
+            self.cp.asarray(ops.invdx[:, 0]), ops.invdy, 50.0, 12.0,
+            scheme="muscl_tvd", limiter="vanleer",
+            coslat=self.cp.asarray(ops.coslat[:, 0]),
+            invcoslat=self.cp.asarray(ops.invcoslat[:, 0]))
+        np.testing.assert_allclose(
+            self.cp.asnumpy(actual), expected, rtol=8e-6, atol=8e-6)
+
     def test_hydrostatic_column_matches_numpy(self):
         from sim.physics import RD
         from sim.primitive import hydrostatic_state

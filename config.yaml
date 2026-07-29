@@ -265,7 +265,9 @@ physics:
     cyclone_max_wind_ms: 120.0
 
 numerics:
-  advection: upwind
+  # Second-order finite-volume transport. Limiters: minmod | vanleer | mc.
+  advection: muscl_tvd
+  advection_limiter: mc
   cos_clamp: 0.1
   # A regular latitude/longitude grid needs zonal filtering where grid cells
   # converge; 88 degrees is unstable for hydrostatic gravity waves.
@@ -284,6 +286,6 @@ server:
   max_fps: 60
   vector_stride: 5
   basemap_width: 2160
-  record_enabled: true
+  record_enabled: false
   record_dir: output/recordings
   record_every_steps: 600
