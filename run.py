@@ -44,6 +44,17 @@ def main():
         el = time.time() - t0
         print(f"{n} 步耗时 {el:.2f}s  ({n/el:.1f} 步/秒, "
               f"模拟加速比 x{n*m.dt/el:.0f})")
+        diagnostics = m.energy_diagnostics()
+        if diagnostics.get("available"):
+            print("能量/质量诊断 (最后一步):")
+            for key in ("total_energy_j_m2", "kinetic_energy_j_m2",
+                        "enthalpy_j_m2", "latent_energy_j_m2",
+                        "dynamics_energy_error_w_m2", "energy_fixer_dT_k",
+                        "physics_energy_change_w_m2", "physics_forcing_w_m2",
+                        "mean_surface_pressure_pa", "total_water_kg_m2",
+                        "advective_cfl", "gravity_wave_cfl"):
+                print(f"  {key}: {diagnostics[key]:.6g}")
+            print(f"  limiter_counts: {diagnostics['limiter_counts']}")
 
     else:  # serve
         stage_started = time.perf_counter()

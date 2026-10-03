@@ -56,7 +56,7 @@ python run.py benchmark
 | backend | `auto / cuda / cpu` | 计算后端 |
 | grid | `nlat, nlon` | 分辨率(实时建议 90×180,预演算可 180×360 以上)|
 | time | `dt, spinup_days` | 时间步长(秒)、启动前预热天数 |
-| physics | `vertical, topography, H0, g_eff, drag_ocean_atmosphere, drag_land_atmosphere, visc …` | 分层、地形作用及其他物理超参数 |
+| physics | `dynamics, vertical, column_physics, topography, drag_ocean_atmosphere, drag_land_atmosphere, visc …` | 动力核心/混合 σ–p 分层/上层阻尼、柱物理、地形作用及其他物理超参数 |
 | precompute | `days, frame_interval_s, out_dir` | 预演算时长与帧间隔 |
 | server | `host, port, max_fps, vector_stride` | 服务与推流参数 |
 
@@ -135,3 +135,68 @@ shallow-water solver is retained as
 This is a hydrostatic core. It does not resolve nonhydrostatic acoustic or
 convective vertical momentum, so kilometre-scale cloud-resolving simulations
 would still require a separate nonhydrostatic dynamical core and microphysics.
+
+### Hybrid sigma-pressure vertical grid
+
+`physics.vertical.coordinate: hybrid` (the shipped `config.yaml`) replaces the
+pure sigma grid with a CAM-style hybrid coordinate. Interface pressure is
+`p = A + B * ps` with `B = 1` at the ground and `B = 0` at and above
+`transition_pressure_pa` (100 hPa), so the stratosphere is integrated on pure
+pressure surfaces and the terrain-following error of the pressure-gradient
+force is confined to the lower troposphere. The default grid has 26 layers
+with a 3 hPa top: seven stretched stratospheric layers, a troposphere uniform
+in `ln p`, and six geometrically refined boundary-layer layers (lowest layer
+about 80 m deep). Explicit CAM `hyai`/`hybi` lists can be supplied instead.
+Nominal layer heights for display and for interpolating ERA5 pressure-level
+data are derived from the standard atmosphere; ERA5 fields are interpolated
+directly to the layer reference pressures. `physics.vertical.coordinate: sigma`
+keeps the old `levels_m`/`sigma_interfaces` grid.
+
+Upper-level damping (`physics.dynamics.upper_damping`) ramps in above 50 hPa:
+implicit Rayleigh friction on the eddy wind (the zonal mean is left alone so a
+polar-night jet can exist), enhanced horizontal diffusion, and enhanced
+second-order divergence damping. The divergence damping itself
+(`divergence_damping_coeff`) acts through the whole column and is scaled by
+the local explicit stability limit, so one dimensionless value is safe at all
+latitudes.
+
+### Time integration, thermodynamics and conservation
+
+- **Transport variable.** Potential temperature is the advected thermodynamic
+  variable: adiabatic compression and expansion are contained in the change of
+  the Exner function along the trajectory, so the former explicit
+  `kappa T omega / p` source term is gone. Horizontal diffusion and the polar
+  filter act on T, because theta varies along terrain-following surfaces even
+  for resting isothermal air. Vertical transport uses the same MUSCL/TVD
+  limiter as the horizontal scheme.
+- **Forward-backward dynamics.** Surface pressure and the interface mass flux
+  are predicted first; the pressure-gradient force is evaluated on the updated
+  mass and temperature. Surface stress, the Rayleigh sponge and vertical mixing
+  are integrated implicitly, so strong drag or short sponge timescales impose
+  no time-step limit. Kinetic energy they remove is returned as heat
+  (`frictional_heating`).
+- **Energy fixer.** The column total energy
+  `sum(dp/g (cp T + K + L q)) + Phi_s (ps - p_top)/g` is evaluated before and
+  after the adiabatic step; the global residual is removed as a uniform
+  temperature increment (`energy_fixer`), as CAM does. Because the state is
+  float32, the increment is accumulated in double precision and applied once
+  it reaches `energy_fixer_min_increment_k` (1e-3 K). Mass and tracer mass
+  are conserved exactly by the shared face fluxes.
+- **Column physics.** Surface sensible and latent fluxes are deposited over a
+  boundary layer (`column_physics.pbl_depth_pa`) rather than one thin layer,
+  radiative terms are spread through the troposphere with mass weights, dry
+  static energy, moisture and momentum are mixed by an implicit
+  Richardson-number-limited eddy diffusivity, and an enthalpy-conserving dry
+  convective adjustment removes static instability.
+- **Diagnostics.** `EarthModel.energy_diagnostics()` (also
+  `GET /api/diagnostics` and the end of `python run.py benchmark`) reports the
+  global energy components, mean surface pressure, total water, advective and
+  gravity-wave Courant numbers, the last step's dynamics energy error and fixer
+  increment, the physics energy change against the applied forcing, and
+  `limiter_counts`: how many cells the wind/temperature/humidity/pressure
+  bounds clipped in the last step. The bounds are kept only as a safety net
+  and a healthy run keeps every count at zero.
+- The ad hoc divergence-proportional "subsidence drying"
+  (`moisture_transport.subsidence_drying_coeff`) removed water and latent
+  energy without a heat source; it is disabled in `config.yaml` because the
+  primitive core resolves subsidence drying through vertical transport.
