@@ -50,13 +50,15 @@ class Ops:
         dlat = _np.pi / nlat
         self.coslat = xp.cos(lat).astype(xp.float32)
         cosl = xp.maximum(self.coslat, cos_clamp)
-        self.invcoslat = (1.0 / cosl).astype(xp.float32)
+        # Only zonal lengths are regularized. Meridional flux divergence must
+        # divide by the actual cell area to conserve spherical global mass.
+        self.invcoslat = (1.0 / self.coslat).astype(xp.float32)
         self.dx = (A_EARTH * cosl * dlon).astype(xp.float32)   # [nlat,1]
         self.dy = _np.float32(A_EARTH * dlat)
         self.invdx = (1.0 / self.dx).astype(xp.float32)
         self.invdy = _np.float32(1.0 / self.dy)
         self.f = (2 * OMEGA * xp.sin(lat)).astype(xp.float32)
-        self.tanl = xp.clip(xp.tan(lat), -3.0, 3.0).astype(xp.float32) / A_EARTH
+        self.tanl = xp.tan(lat).astype(xp.float32) / A_EARTH
         self.advection_scheme = str(advection_scheme).lower()
         self.advection_limiter = str(advection_limiter).lower()
         north_face_mask = _np.ones((nlat, 1), dtype=_np.float32)
@@ -229,7 +231,10 @@ class Ops:
 
     def polar_filter(self, F):
         """高纬纬向 1-2-1 平滑, 抑制极点数值噪声。"""
-        if self.cuda_adv is not None:
+        # Moist mass increments can be promoted to float64. Keep that
+        # precision via array operations rather than passing doubles to the
+        # float32-only raw CUDA kernel (or silently reinterpreting them).
+        if self.cuda_adv is not None and F.dtype == self.xp.float32:
             return self.cuda_adv.polar_filter(F, self.pf_w_flat,
                                               self.pf_passes)
         s = F

@@ -36,7 +36,8 @@ class MultilayerModelTests(unittest.TestCase):
         model = EarthModel(cfg)
         self.assertEqual(model.u_layers.shape, (5, 12, 24))
         self.assertGreater(float(np.abs(model.u_layers).max()), 1.0)
-        self.assertGreater(float(np.abs(model.v_layers).max()), 0.1)
+        self.assertEqual(float(np.abs(model.v_layers).max()), 0.0)
+        self.assertTrue(model.initial_balance["passed"])
 
         cfg["physics"]["ideal_wind_enabled"] = False
         calm = EarthModel(cfg)

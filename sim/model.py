@@ -12,6 +12,9 @@ from .physics import (Ops, qsat, insolation, A_EARTH,
 from .primitive import (validate_sigma_interfaces, hydrostatic_state,
                         sigma_mass_flux, mass_consistent_transport,
                         pressure_vertical_velocity)
+from .balance import (initialize_balanced, balance_report, budget_changes,
+                      filter_increments, polar_divergence_damping)
+from .diagnostics import stability_report
 
 
 class EarthModel:
@@ -79,6 +82,14 @@ class EarthModel:
               f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         stage_started = _time.perf_counter()
         self._init_state()
+        if self._primitive_enabled:
+            self.initial_balance = balance_report(self)
+            self.stabilization_budget = {}
+            self.stabilization_budget_total = {}
+            self.stability_diagnostics = {}
+            self._diagnostic_interval = int(self.cfg.numerics.diagnostic_interval_steps)
+            if self._diagnostic_interval < 1:
+                raise ValueError("diagnostic_interval_steps must be positive")
         print(f"[startup] model state initialized ({self.initialization_source}): "
               f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         print(f"[startup] EarthModel initialization complete: "
@@ -183,7 +194,7 @@ class EarthModel:
                                 / float(ic.humidity_decay_height_m)))
         self.q_layers = (xp.asarray(rh_profile, dtype=f32)[:, None, None]
                          * qsat(xp, self.T_layers)).astype(f32)
-        wave_amp = float(p.ideal_wave_amp_K)
+        wave_amp = 0.0 if self._primitive_enabled else float(p.ideal_wave_amp_K)
         if wave_amp:
             lon = self.ops.lon_rad
             wave = ((xp.sin(float(ic.temp_wave_lon1) * lon
@@ -325,6 +336,9 @@ class EarthModel:
 
     def _init_primitive_state(self):
         """Initialize surface pressure and hydrostatic sigma-level geometry."""
+        if self.initialization_source == "idealized":
+            initialize_balanced(self)
+            return
         xp, p = self.xp, self.cfg.physics
         dyn, bounds = p.dynamics, p.bounds
         psl = self._initial_mslp_hpa * 100.0
@@ -342,81 +356,6 @@ class EarthModel:
             self._sigma_interfaces_xp, float(dyn.top_pressure_pa),
             self.surface_geopotential)
         self.pressure_interfaces_pa, self.pressure_layers_pa = state[:2]
-
-        if self.initialization_source == "idealized":
-            ic = p.initial_conditions
-            # Build the ideal atmosphere on pressure surfaces. Using the same
-            # T at the same sigma over both mountains and ocean creates a large
-            # artificial PGF because those sigma points have different p/z.
-            reference_height = -float(p.vertical.scale_height) * xp.log(
-                self.pressure_layers_pa
-                / float(dyn.reference_surface_pressure_pa))
-            reference_height = xp.maximum(reference_height, 0.0)
-            base_temperature = (
-                float(ic.equilibrium_temp_base_k)
-                - float(ic.equilibrium_temp_pole_delta_k)
-                * xp.sin(self.ops.lat) ** 2)
-            self.T_layers = self._equilibrium_temperature_profile(
-                base_temperature, reference_height)
-            wave_amp = float(p.ideal_wave_amp_K)
-            if wave_amp:
-                lon, lat = self.ops.lon_rad, self.ops.lat
-                wave = ((xp.sin(float(ic.temp_wave_lon1) * lon
-                                + float(ic.temp_wave_phase1) * xp.sin(lat))
-                         + float(ic.temp_wave_weight2)
-                         * xp.sin(float(ic.temp_wave_lon2) * lon
-                                  + float(ic.temp_wave_phase2) * xp.sin(lat)))
-                        * xp.cos(lat) ** 2)
-                self.T_layers += (
-                    wave_amp * xp.exp(
-                        -reference_height
-                        / float(ic.temp_wave_decay_height_m)) * wave)
-            self.T_layers = xp.clip(
-                self.T_layers, float(bounds.air_temp_min_k),
-                float(bounds.air_temp_max_k)).astype(xp.float32)
-
-            # Recompute terrain surface pressure with the thermodynamically
-            # consistent lowest-level temperature.
-            tv0 = self.T_layers[0] * (1.0 + 0.608 * self.q_layers[0])
-            self.surface_pressure = xp.clip(
-                psl * xp.exp(-self.surface_geopotential
-                             / xp.maximum(RD * tv0, 1.0)),
-                float(dyn.min_surface_pressure_pa),
-                float(dyn.max_surface_pressure_pa)).astype(xp.float32)
-            state = hydrostatic_state(
-                xp, self.T_layers, self.q_layers, self.surface_pressure,
-                self._sigma_interfaces_xp, float(dyn.top_pressure_pa),
-                self.surface_geopotential)
-            self.pressure_interfaces_pa, self.pressure_layers_pa = state[:2]
-
-        # Ideal humidity was originally built with a fixed 1000-hPa qsat.
-        # Reconstruct it at the actual layer pressure while preserving the
-        # intended relative-humidity profile and wave perturbation.
-        if self.initialization_source == "idealized" and p.moisture:
-            ic = p.initial_conditions
-            rh_profile = (float(p.init_upper_rh)
-                          + (float(p.init_surface_rh)
-                             - float(p.init_upper_rh))
-                          * _np.exp(-self.levels_m
-                                    / float(ic.humidity_decay_height_m)))
-            rh = xp.asarray(rh_profile, dtype=xp.float32)[:, None, None]
-            if float(p.ideal_humidity_wave):
-                lon, lat = self.ops.lon_rad, self.ops.lat
-                wave = ((xp.sin(float(ic.temp_wave_lon1) * lon
-                                + float(ic.temp_wave_phase1) * xp.sin(lat))
-                         + float(ic.temp_wave_weight2)
-                         * xp.sin(float(ic.temp_wave_lon2) * lon
-                                  + float(ic.temp_wave_phase2) * xp.sin(lat)))
-                        * xp.cos(lat) ** 2)
-                rh = rh * (1.0 + float(p.ideal_humidity_wave) * wave)
-            self.q_layers = xp.clip(
-                rh * qsat(xp, self.T_layers, self.pressure_layers_pa),
-                float(bounds.humidity_min),
-                float(bounds.humidity_max)).astype(xp.float32)
-            state = hydrostatic_state(
-                xp, self.T_layers, self.q_layers, self.surface_pressure,
-                self._sigma_interfaces_xp, float(dyn.top_pressure_pa),
-                self.surface_geopotential)
 
         (self.pressure_interfaces_pa, self.pressure_layers_pa,
          self.geopotential_layers, self.geopotential_interfaces,
@@ -554,10 +493,10 @@ class EarthModel:
         return xp.where(self.ocean > 0.5, surface, Ts)
 
     def _initial_wind_layers(self, shape3, dtype):
-        """Return an idealized balanced-ish zonal wind with wave seeds."""
+        """Hand-specified wind seeds for the legacy shallow-water core only."""
         xp, p = self.xp, self.cfg.physics
         ws = p.ideal_wind_shape
-        if not bool(p.ideal_wind_enabled):
+        if self._primitive_enabled or not bool(p.ideal_wind_enabled):
             return xp.zeros(shape3, dtype), xp.zeros(shape3, dtype)
 
         lat = self.ops.lat
@@ -918,6 +857,14 @@ class EarthModel:
 
     def _step_primitive_equations(self):
         """Advance the moist hydrostatic primitive equations in sigma space."""
+        if self.step_count == 0:
+            # Include edits made after construction in the startup gate.
+            self._refresh_primitive_diagnostics()
+            self.initial_balance = balance_report(self)
+            if not self.initial_balance["passed"]:
+                raise ValueError(
+                    "initial meridional momentum residual exceeds balance tolerance; "
+                    "adjust/balance the initial data before formal integration")
         xp, p, o, dt = self.xp, self.cfg.physics, self.ops, self.dt
         dyn, bounds = p.dynamics, p.bounds
         rt, sf, mt = p.radiation_transfer, p.surface_flux, p.moisture_transport
@@ -999,8 +946,9 @@ class EarthModel:
         ps_diff = float(dyn.surface_pressure_diffusivity)
         if ps_diff:
             ps_tendency = ps_tendency + ps_diff * o.lap(ps0)
+        ps_predictor = ps0 + dt * ps_tendency
         ps1 = xp.clip(
-            ps0 + dt * ps_tendency,
+            ps_predictor,
             float(dyn.min_surface_pressure_pa),
             float(dyn.max_surface_pressure_pa))
         mu0 = ps0 - p_top
@@ -1032,7 +980,14 @@ class EarthModel:
         drag_u, drag_v = self._primitive_boundary_drag(u0, v0)
         u += dt * (-pgf_x + drag_u + o.tanl * u0 * v0)
         v += dt * (-pgf_y + drag_v - o.tanl * u0 * u0)
-        u, v = o.coriolis_rotate(u, v, dt)
+        # Solve Coriolis and the pressure forcing together with a midpoint
+        # rotation; splitting a forced kick and exact rotation disturbs even
+        # an exactly balanced gradient-wind state at every time step.
+        half_fdt = 0.5 * dt * o.f
+        rhs_u, rhs_v = u + half_fdt * v0, v - half_fdt * u0
+        denominator = 1.0 + half_fdt ** 2
+        u = (rhs_u + half_fdt * rhs_v) / denominator
+        v = (rhs_v - half_fdt * rhs_u) / denominator
 
         # Pressure velocity and adiabatic compression/expansion.
         omega = pressure_vertical_velocity(
@@ -1094,15 +1049,36 @@ class EarthModel:
 
         # Water crossing the lower boundary changes total atmospheric mass;
         # precipitation leaves it. This term is small but closes the budget.
+        ps_surface_predictor = ps1 + g * (dt * evaporation - rain_mass)
         ps1 = xp.clip(
-            ps1 + g * (dt * evaporation - rain_mass),
+            ps_surface_predictor,
             float(dyn.min_surface_pressure_pa),
             float(dyn.max_surface_pressure_pa))
 
-        u = o.polar_filter(u)
-        v = o.polar_filter(v)
-        T = o.polar_filter(T)
-        q = o.polar_filter(q)
+        fields_before = (u, v, T, q)
+        v = polar_divergence_damping(self, v, dt, ps1)
+        damping_changes = budget_changes(self, ps1, fields_before, ps1, (u, v, T, q))
+        fields_before, ps_before = (u, v, T, q), ps1
+        ps1, (u, v, T, q) = filter_increments(
+            self, ps1, (u, v, T, q), ps0, (u0, v0, T0, q0))
+        self.stabilization_budget = {
+            "divergence_damping": damping_changes,
+            "polar_filter": budget_changes(self, ps_before, fields_before, ps1, (u, v, T, q)),
+        }
+        del fields_before, ps_before
+        for operation, changes in self.stabilization_budget.items():
+            total = self.stabilization_budget_total.setdefault(operation, {})
+            for key, value in changes.items():
+                total[key] = total.get(key, 0.0) + value
+        if self.step_count % self._diagnostic_interval == 0:
+            self.stability_diagnostics = stability_report(
+                self, ps1, (u, v, T, q), ps_tendency, interface_flux,
+                pressure_candidates=(ps_predictor, ps_surface_predictor))
+            print(f"[stabilization] step={self.step_count} "
+                  f"changes={self.stabilization_budget}", flush=True)
+            print(f"[stability] {self.stability_diagnostics}", flush=True)
+            if not self.stability_diagnostics["finite"]:
+                raise FloatingPointError("non-finite state before clipping; see [stability]")
         self.u_layers = xp.clip(u, -p.umax, p.umax).astype(xp.float32)
         self.v_layers = xp.clip(v, -p.umax, p.umax).astype(xp.float32)
         self.T_layers = xp.clip(

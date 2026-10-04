@@ -119,6 +119,9 @@ physics:
     wave_phase: 0.8
 
   initial_conditions:
+    # Primitive ideal initialization uses a flat dynamical lower boundary.
+    balanced_perturbation_k: 0.001
+    balance_tolerance_ms2: 1.0e-4
     equilibrium_temp_base_k: 308.0
     equilibrium_temp_pole_delta_k: 42.0
     surface_lapse_rate: 0.0065
@@ -265,6 +268,7 @@ physics:
     cyclone_max_wind_ms: 120.0
 
 numerics:
+  diagnostic_interval_steps: 60  # pre-clipping field/CFL/bounds diagnostics
   # Second-order finite-volume transport. Limiters: minmod | vanleer | mc.
   advection: muscl_tvd
   advection_limiter: mc
@@ -273,6 +277,7 @@ numerics:
   # converge; 88 degrees is unstable for hydrostatic gravity waves.
   polar_filter_lat: 70.0
   polar_filter_passes: 6
+  polar_divergence_damping_m2s: 2.0e5
 
 precompute:
   out_dir: output/run1

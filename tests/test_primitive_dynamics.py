@@ -157,4 +157,7 @@ def test_primitive_step_uses_two_hydrostatic_integrations(monkeypatch):
     monkeypatch.setattr(model_module, "hydrostatic_state", counted)
     model.step(1)
 
+    assert len(calls) == 3  # first-step balance gate also refreshes edited data
+    calls.clear()
+    model.step(1)
     assert len(calls) == 2

@@ -43,6 +43,8 @@ DEFAULTS = {
         "alb_ice": 0.62, "alb_snow": 0.70, "alb_cloud": 0.42,
         "tau_relax_T": 864000.0,
         "initial_conditions": {
+            "balanced_perturbation_k": 0.001,
+            "balance_tolerance_ms2": 1.0e-4,
             "equilibrium_temp_base_k": 308.0,
             "equilibrium_temp_pole_delta_k": 42.0,
             "surface_lapse_rate": 0.0065,
@@ -214,6 +216,8 @@ DEFAULTS = {
         },
     },
     "numerics": {"advection": "muscl_tvd", "advection_limiter": "mc",
+                 "diagnostic_interval_steps": 60,
+                 "polar_divergence_damping_m2s": 2.0e5,
                  "cos_clamp": 0.2,
                  "polar_filter_lat": 65.0, "polar_filter_passes": 6},
     "precompute": {"out_dir": "output/run1", "days": 3,
