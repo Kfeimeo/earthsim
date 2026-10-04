@@ -13,7 +13,7 @@ import time
 
 import numpy as np
 
-from sim.analysis import analyze_point
+from sim.analysis import analyze_point, locate_cell
 from sim.backend import to_cpu
 from sim.model import EarthModel
 from sim.precompute import FramePlayer
@@ -28,6 +28,35 @@ LAYER_RANGES = {
     "ice": (0.0, 1.0),
 }
 SCALARS = list(LAYER_RANGES.keys())
+
+
+def atmosphere_levels_hpa(model):
+    """Reference pressure of each model layer in hPa, or None."""
+    pressures = getattr(model, "reference_pressure_layers_pa", None)
+    if pressures is None:
+        return None
+    return [round(float(p) / 100.0, 2) for p in pressures]
+
+
+def levels_hpa_from_manifest(manifest):
+    """Layer pressures for playback: stored, or rebuilt from the grid."""
+    stored = manifest.get("atmosphere_levels_hpa")
+    if stored:
+        return [float(p) for p in stored]
+    a, b = manifest.get("hybrid_a_pa"), manifest.get("hybrid_b")
+    if a and b and len(a) == len(b) and len(a) > 1:
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        interfaces = a + b * 101300.0
+        return [round(float(p) / 100.0, 2)
+                for p in 0.5 * (interfaces[:-1] + interfaces[1:])]
+    sigma = manifest.get("sigma_interfaces")
+    top = manifest.get("top_pressure_pa")
+    if sigma and top is not None and len(sigma) > 1:
+        sigma = np.asarray(sigma, float)
+        interfaces = float(top) + sigma * (101300.0 - float(top))
+        return [round(float(p) / 100.0, 2)
+                for p in 0.5 * (interfaces[:-1] + interfaces[1:])]
+    return None
 
 
 class LiveRecorder:
@@ -59,6 +88,7 @@ class LiveRecorder:
             "save_every_steps": self.every_steps,
             "backend": model.backend,
             "atmosphere_levels_m": model.levels_m.tolist(),
+            "atmosphere_levels_hpa": atmosphere_levels_hpa(model),
             "times": self.times,
         }
         if getattr(model, "_primitive_enabled", False):
@@ -212,6 +242,41 @@ class Hub:
             return self.model.levels_m.tolist()
         return self.player.manifest.get("atmosphere_levels_m", [])
 
+    def _atmosphere_levels_hpa(self):
+        if self.model:
+            return atmosphere_levels_hpa(self.model)
+        return levels_hpa_from_manifest(self.player.manifest)
+
+    def _vertical_coordinate(self):
+        if self.model:
+            return getattr(self.model, "vertical_coordinate", "height")
+        return self.player.manifest.get("vertical_coordinate", "height")
+
+    def column_at(self, i, j):
+        """Per-level arrays of one grid cell for the analysis profile."""
+        if self.model is not None:
+            try:
+                return self.model.atmosphere_column_cpu(i, j)
+            except Exception:
+                return None
+        f = self.fields
+        if "u_layers" not in f or "v_layers" not in f:
+            return None
+        column = {"u": f["u_layers"][:, i, j], "v": f["v_layers"][:, i, j]}
+        if "pressure_layers_pa" in f:
+            column["pressure_pa"] = f["pressure_layers_pa"][:, i, j]
+        levels = self._atmosphere_levels()
+        if len(levels) == column["u"].shape[0]:
+            column["levels_m"] = np.asarray(levels, dtype=np.float32)
+        return column
+
+    def analyze(self, lat, lon):
+        i, j = locate_cell(self.lats, self.lons, lat, lon)
+        return analyze_point(
+            self.fields, self.lats, self.lons, self.land, lat, lon,
+            column=self.column_at(i, j),
+            selected_layer=self._clip_atmosphere_layer(self.wind_layer_index))
+
     def _clip_atmosphere_layer(self, k):
         levels = self._atmosphere_levels()
         n = max(len(levels), 1)
@@ -264,6 +329,8 @@ class Hub:
                 "ocean_layer_index": self._clip_ocean_layer(self.ocean_layer_index),
                 "ocean_layer_available": self._has_ocean_layers(f)}
         meta["atmosphere_levels_m"] = self._atmosphere_levels()
+        meta["atmosphere_levels_hpa"] = self._atmosphere_levels_hpa()
+        meta["vertical_coordinate"] = self._vertical_coordinate()
         if self.mode == "playback":
             meta["frame"], meta["nframes"] = self.idx, self.player.n
             ss = f.get("subsolar")
@@ -468,6 +535,8 @@ def create_app(cfg, playback_dir=None):
         return {"mode": hub.mode, "shape": [len(hub.lats), len(hub.lons)],
                 "layers": SCALARS, "ranges": LAYER_RANGES,
                 "atmosphere_levels_m": levels,
+                "atmosphere_levels_hpa": hub._atmosphere_levels_hpa(),
+                "vertical_coordinate": hub._vertical_coordinate(),
                 "nframes": hub.player.n if hub.mode == "playback" else None,
                 "backend": hub.model.backend if hub.model else "playback",
                 "initialization": (getattr(hub.model, "initialization_source", "unknown")
@@ -493,8 +562,7 @@ def create_app(cfg, playback_dir=None):
     @app.get("/api/analyze")
     async def analyze(lat: float, lon: float):
         try:
-            return analyze_point(hub.fields, hub.lats, hub.lons,
-                                 hub.land, lat, lon)
+            return hub.analyze(lat, lon)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 

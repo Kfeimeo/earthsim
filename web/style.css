@@ -88,6 +88,9 @@ body {
   color: var(--dim);
 }
 .flow-layer select { flex: 1; min-width: 0; }
+.flow-caption { font-size: 10px; color: var(--dim); margin: 3px 0 0 2px; min-height: 12px; }
+.flow-controls optgroup { color: var(--dim); font-style: normal; font-size: 11px; }
+.flow-controls optgroup option { color: #dbe6f2; }
 .flow-density input[type=range] { flex: 1; min-width: 0; accent-color: var(--teal); }
 .flow-density .mono { min-width: 14px; text-align: right; color: var(--amber); }
 #legend { margin-top: 14px; }
@@ -97,7 +100,8 @@ body {
 
 /* ---- 分析卡片 ---- */
 #analysis-card {
-  position: fixed; right: 16px; top: 64px; width: 240px;
+  position: fixed; right: 16px; top: 64px; width: 272px;
+  max-height: calc(100vh - 140px); overflow-y: auto;
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 16px; backdrop-filter: blur(8px);
 }
@@ -112,6 +116,24 @@ body {
 .card-grid { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12px; }
 .card-grid .k { color: var(--dim); }
 .card-grid .v { color: var(--amber); text-align: right; }
+#card-profile { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.profile-toggle {
+  background: none; border: none; color: var(--text); font-size: 12px;
+  cursor: pointer; padding: 2px 0; width: 100%; text-align: left;
+}
+.profile-toggle:hover { color: var(--teal); }
+.profile-table {
+  display: grid; gap: 1px 8px; margin-top: 6px; font-size: 11px;
+  max-height: 260px; overflow-y: auto; align-content: start;
+}
+.profile-table .h {
+  color: var(--dim); font-size: 10px; position: sticky; top: 0;
+  background: var(--panel); padding-bottom: 2px; text-align: right;
+}
+.profile-table .c { text-align: right; color: var(--text); cursor: pointer; padding: 1px 0; white-space: nowrap; }
+.profile-table .c .dir { color: var(--dim); font-size: 10px; }
+.profile-table .c.sel { color: var(--teal); background: rgba(94, 234, 212, 0.10); }
+.profile-table .c:hover { color: var(--amber); }
 
 /* ---- 播放控制 ---- */
 #transport {

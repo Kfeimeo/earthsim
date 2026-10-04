@@ -36,6 +36,11 @@ def run_precompute(cfg, days=None, progress=True):
         "save_every_steps": save_every,
         "backend": model.backend,
         "atmosphere_levels_m": model.levels_m.tolist(),
+        "atmosphere_levels_hpa": (
+            [round(float(p) / 100.0, 2)
+             for p in model.reference_pressure_layers_pa]
+            if getattr(model, "reference_pressure_layers_pa", None) is not None
+            else None),
         "times": [],
     }
     if getattr(model, "_primitive_enabled", False):

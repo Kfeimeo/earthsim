@@ -31,8 +31,9 @@
       <option value="streamline">流线图</option>
     </select>
     <div class="flow-layer" id="wind-layer-row">
-      <span>高度</span><select id="wind-layer"></select>
+      <span>层次</span><select id="wind-layer" title="模式层: 气压 · 标准大气高度"></select>
     </div>
+    <div class="flow-caption mono" id="wind-layer-caption"></div>
     <div class="flow-density">
       <span>密度</span><input type="range" id="wind-density" min="1" max="10" step="1"><span class="mono" id="wind-density-label"></span>
     </div>
@@ -88,6 +89,10 @@
     </div>
   </div>
   <div class="card-grid mono" id="card-grid"></div>
+  <div id="card-profile" class="hidden">
+    <button id="profile-toggle" class="profile-toggle">▸ 垂直廓线</button>
+    <div class="profile-table mono hidden" id="profile-table" title="点击某层可切换风场叠加到该层"></div>
+  </div>
 </div>
 
 <footer id="transport">

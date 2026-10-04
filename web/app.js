@@ -40,6 +40,7 @@ camera.position.set(0, 0.6, 3.2);
 const meta = await (await fetch("/api/meta")).json();
 const [NLAT, NLON] = meta.shape;
 let atmosphereLevels = Array.isArray(meta.atmosphere_levels_m) ? meta.atmosphere_levels_m : [];
+let atmosphereLevelsHpa = Array.isArray(meta.atmosphere_levels_hpa) ? meta.atmosphere_levels_hpa : [];
 let windLayerAvailable = meta.wind_layer_available !== false;
 let pendingWindLayer = null;
 let oceanLayerAvailable = meta.ocean_layer_available === true;
@@ -450,6 +451,26 @@ async function refreshSelectedAnalysis(force = false) {
     analysisPending = false;
   }
 }
+let profileExpanded = false;
+let lastProfile = null;
+
+function formatHeight(z) {
+  if (!Number.isFinite(z)) return "";
+  return z >= 1000 ? `${(z / 1000).toFixed(1)} km` : `${Math.round(z)} m`;
+}
+function formatPressure(p) {
+  if (!Number.isFinite(p)) return "";
+  return p >= 100 ? `${Math.round(p)} hPa` : `${p.toFixed(1)} hPa`;
+}
+function levelCaption(k) {
+  const p = atmosphereLevelsHpa[k];
+  const z = atmosphereLevels[k];
+  if (Number.isFinite(p) && Number.isFinite(z)) return `${formatPressure(p)} · ${formatHeight(z)}`;
+  if (Number.isFinite(p)) return formatPressure(p);
+  if (Number.isFinite(z)) return formatHeight(z);
+  return `第 ${k + 1} 层`;
+}
+
 function showCard(d) {
   if (d.error) return;
   document.getElementById("card-icon").textContent = d.icon;
@@ -458,14 +479,71 @@ function showCard(d) {
     `${Math.abs(d.lat).toFixed(1)}°${d.lat >= 0 ? "N" : "S"}  ${d.lon.toFixed(1)}°E · ${d.surface}`;
   const rows = [["气温", d.temp + " °C"], ["气压", d.pressure + " hPa"],
     ["比湿", d.humidity + " g/kg"], ["云量", d.cloud + " %"],
-    ["降水", d.precip + " mm/h"], ["风", d.wind_speed + " m/s / " + d.wind_dir + "°"]];
+    ["降水", d.precip + " mm/h"], ["近地面风", d.wind_speed + " m/s / " + d.wind_dir + "°"]];
+  const selected = d.profile && d.profile.selected;
+  if (selected && selected.index > 0) {
+    const where = Number.isFinite(selected.pressure) ? `${formatPressure(selected.pressure)}` : `第 ${selected.index + 1} 层`;
+    rows.push([`所选层风 (${where})`, selected.wind_speed + " m/s / " + selected.wind_dir + "°"]);
+  }
   if (d.ground_water !== undefined) rows.push(["地表储水", d.ground_water + " mm"]);
   if (d.sst !== undefined) rows.push(["海温", d.sst + " °C"], ["洋流", d.current + " m/s"]);
   if (d.ice > 0) rows.push(["冰雪", d.ice + " %"]);
   document.getElementById("card-grid").innerHTML =
     rows.map(([k, v]) => `<span class="k">${k}</span><span class="v">${v}</span>`).join("");
+  lastProfile = d.profile || null;
+  renderProfile();
   document.getElementById("analysis-card").classList.remove("hidden");
 }
+
+function renderProfile() {
+  const box = document.getElementById("card-profile");
+  const toggle = document.getElementById("profile-toggle");
+  const table = document.getElementById("profile-table");
+  const profile = lastProfile;
+  if (!profile || !Array.isArray(profile.levels) || profile.levels.length < 2) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  const n = profile.levels.length;
+  toggle.textContent = `${profileExpanded ? "▾" : "▸"} 垂直廓线 (${n} 层)`;
+  table.classList.toggle("hidden", !profileExpanded);
+  if (!profileExpanded) return;
+
+  const first = profile.levels[0];
+  const hasP = first.pressure !== undefined;
+  const hasT = first.temp !== undefined;
+  const hasRH = first.rh !== undefined;
+  const hasW = first.w !== undefined;
+  const head = [hasP ? "hPa" : "层", hasT ? "°C" : null, hasRH ? "RH" : null, "风 m/s", hasW ? "w cm/s" : null]
+    .filter(h => h !== null);
+  const cols = head.length;
+  table.style.gridTemplateColumns = `repeat(${cols}, auto)`;
+  const cells = head.map(h => `<span class="h">${h}</span>`);
+  for (const lv of profile.levels) {
+    const sel = lv.index === profile.selected_layer ? " sel" : "";
+    const vals = [
+      hasP ? (lv.pressure >= 100 ? Math.round(lv.pressure) : lv.pressure.toFixed(1)) : String(lv.index + 1),
+      hasT ? lv.temp.toFixed(1) : null,
+      hasRH ? `${lv.rh}%` : null,
+      `${lv.wind_speed.toFixed(0)} <span class="dir">${lv.wind_dir}°</span>`,
+      hasW ? lv.w.toFixed(1) : null,
+    ].filter(v => v !== null);
+    const z = Number.isFinite(lv.height) ? ` title="约 ${formatHeight(lv.height)}"` : "";
+    for (const v of vals) cells.push(`<span class="c${sel}"${z} data-k="${lv.index}">${v}</span>`);
+  }
+  table.innerHTML = cells.join("");
+}
+document.getElementById("profile-toggle").onclick = () => {
+  profileExpanded = !profileExpanded;
+  renderProfile();
+};
+// 点击廓线的某一层即切换风场叠加到该层
+document.getElementById("profile-table").onclick = (e) => {
+  const k = e.target.closest("[data-k]")?.dataset.k;
+  if (k === undefined || !windLayerAvailable) return;
+  selectWindLayer(parseInt(k));
+};
 document.getElementById("card-close").onclick = () => {
   document.getElementById("analysis-card").classList.add("hidden");
   selectedPoint = null;
@@ -505,8 +583,15 @@ function clampOceanLayer(k) {
   return Math.max(0, Math.min(oceanLayerCount() - 1, parseInt(k || 0)));
 }
 function formatWindLayerLabel(k) {
-  const z = atmosphereLevels[k];
-  return Number.isFinite(z) ? `${Math.round(z)} m` : `第 ${k + 1} 层`;
+  return `L${k + 1}  ${levelCaption(k)}`;
+}
+// 26 层以上时按气压区段分组, 便于在下拉框中定位
+function windLayerGroup(k) {
+  const p = atmosphereLevelsHpa[k];
+  if (!Number.isFinite(p)) return null;
+  if (p >= 850) return "近地面 / 边界层";
+  if (p >= 150) return "自由对流层";
+  return "对流层顶与平流层";
 }
 function formatOceanLayerLabel(k) {
   return k === 1 ? "深层" : "表层";
@@ -515,22 +600,56 @@ function sameAtmosphereLevels(next) {
   if (!Array.isArray(next) || next.length !== atmosphereLevels.length) return false;
   return next.every((z, i) => z === atmosphereLevels[i]);
 }
+function sameAtmosphereLevelsHpa(next) {
+  if (!Array.isArray(next)) return atmosphereLevelsHpa.length === 0;
+  if (next.length !== atmosphereLevelsHpa.length) return false;
+  return next.every((p, i) => p === atmosphereLevelsHpa[i]);
+}
 function setupWindLayerControl() {
   const row = document.getElementById("wind-layer-row");
   const layer = document.getElementById("wind-layer");
   const count = windLayerCount();
   layer.innerHTML = "";
-  for (let k = 0; k < count; k++) {
+  // 自上而下排列(如探空), 并按区段分组
+  let group = null, groupLabel = undefined;
+  for (let k = count - 1; k >= 0; k--) {
     const opt = document.createElement("option");
     opt.value = String(k);
     opt.textContent = formatWindLayerLabel(k);
-    layer.appendChild(opt);
+    const label = windLayerGroup(k);
+    if (count > 8 && label !== null) {
+      if (label !== groupLabel) {
+        group = document.createElement("optgroup");
+        group.label = label;
+        layer.appendChild(group);
+        groupLabel = label;
+      }
+      group.appendChild(opt);
+    } else {
+      layer.appendChild(opt);
+    }
   }
   row.classList.toggle("hidden", count <= 1 || !windLayerAvailable);
   layer.disabled = !windLayerAvailable;
   flowState.wind.layer = clampWindLayer(flowState.wind.layer);
   if (pendingWindLayer !== null) pendingWindLayer = clampWindLayer(pendingWindLayer);
   layer.value = String(flowState.wind.layer);
+  updateWindLayerCaption();
+}
+function updateWindLayerCaption() {
+  const caption = document.getElementById("wind-layer-caption");
+  if (!caption) return;
+  const k = flowState.wind.layer;
+  caption.textContent = windLayerCount() > 1 ? `第 ${k + 1}/${windLayerCount()} 层 · ${levelCaption(k)}` : "";
+}
+function selectWindLayer(k) {
+  k = clampWindLayer(k);
+  const layer = document.getElementById("wind-layer");
+  if (layer) layer.value = String(k);
+  flowState.wind.layer = k;
+  pendingWindLayer = k;
+  updateWindLayerCaption();
+  send({ cmd: "set_wind_layer", value: k });
 }
 function setupOceanLayerControl() {
   const row = document.getElementById("ocean-layer-row");
@@ -555,6 +674,10 @@ function syncWindLayerMeta(m) {
     atmosphereLevels = m.atmosphere_levels_m;
     controlsChanged = true;
   }
+  if ("atmosphere_levels_hpa" in m && !sameAtmosphereLevelsHpa(m.atmosphere_levels_hpa)) {
+    atmosphereLevelsHpa = Array.isArray(m.atmosphere_levels_hpa) ? m.atmosphere_levels_hpa : [];
+    controlsChanged = true;
+  }
   if (typeof m.wind_layer_available === "boolean" && windLayerAvailable !== m.wind_layer_available) {
     windLayerAvailable = m.wind_layer_available;
     controlsChanged = true;
@@ -569,9 +692,15 @@ function syncWindLayerSelection(m) {
   if (waitingForSelection && serverLayer !== pendingWindLayer) return false;
 
   pendingWindLayer = null;
+  const changed = flowState.wind.layer !== serverLayer;
   flowState.wind.layer = serverLayer;
   const layer = document.getElementById("wind-layer");
   if (layer) layer.value = String(serverLayer);
+  updateWindLayerCaption();
+  if (changed && lastProfile) {
+    lastProfile.selected_layer = serverLayer;
+    renderProfile();
+  }
   return true;
 }
 function syncOceanLayerMeta(m) {
@@ -620,6 +749,7 @@ function setupFlowControls(name) {
       if (name === "wind") pendingWindLayer = state.layer;
       else pendingOceanLayer = state.layer;
       layer.value = String(state.layer);
+      if (name === "wind") updateWindLayerCaption();
       clearLines(flowLines[name]);
       send({ cmd: name === "wind" ? "set_wind_layer" : "set_ocean_layer", value: state.layer });
     };

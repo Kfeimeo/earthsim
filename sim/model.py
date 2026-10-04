@@ -502,6 +502,10 @@ class EarthModel:
                                   + float(ic.temp_wave_phase2) * xp.sin(lat)))
                         * xp.cos(lat) ** 2)
                 rh = rh * (1.0 + float(p.ideal_humidity_wave) * wave)
+            # The tropospheric RH profile would give grams per kilogram of
+            # vapour at a few hPa; taper it to a few percent above 200 hPa so
+            # the stratosphere starts nearly dry.
+            rh = rh * xp.clip((pressure_layers - 7000.0) / 13000.0, 0.03, 1.0)
             self.q_layers = xp.clip(
                 rh * qsat(xp, self.T_layers, pressure_layers),
                 float(bounds.humidity_min),
