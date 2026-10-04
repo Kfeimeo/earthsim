@@ -243,7 +243,8 @@ def _level_kind(ds, name):
 
 
 def _profile(da, ds, target_time, target_lats, target_lons, levels_m,
-             reference_pressure_pa=101325.0, scale_height_m=8400.0):
+             reference_pressure_pa=101325.0, scale_height_m=8400.0,
+             target_pressure_pa=None):
     level_name, source_levels = _pressure_or_height(da, ds)
     if not level_name:
         return np.stack([_horizontal(da, ds, target_time, target_lats, target_lons)
@@ -258,8 +259,12 @@ def _profile(da, ds, target_time, target_lats, target_lons, levels_m,
         units = str(ds[level_name].attrs.get("units", "")).lower()
         if units in {"hpa", "mb", "millibar"} or np.nanmax(source_levels) < 2000:
             source_levels *= 100.0
-        target_coord = float(reference_pressure_pa) * np.exp(
-            -np.asarray(levels_m) / float(scale_height_m))
+        if target_pressure_pa is not None:
+            # The model supplies the exact reference pressure of each layer.
+            target_coord = np.asarray(target_pressure_pa, dtype=np.float64)
+        else:
+            target_coord = float(reference_pressure_pa) * np.exp(
+                -np.asarray(levels_m) / float(scale_height_m))
     else:
         target_coord = np.asarray(levels_m, dtype=np.float64)
     order = np.argsort(source_levels)
@@ -317,20 +322,28 @@ def _saturation_specific_humidity(temp_k, pressure_pa):
 def _find_and_field(ds, aliases, target_time, target_lats, target_lons,
                     *, profile=False, levels_m=(),
                     profile_reference_pressure_pa=101325.0,
-                    profile_scale_height_m=8400.0):
+                    profile_scale_height_m=8400.0,
+                    profile_target_pressure_pa=None):
     da = _find_variable(ds, aliases)
     if da is None:
         return None, None
     result = (_profile(
         da, ds, target_time, target_lats, target_lons, levels_m,
         reference_pressure_pa=profile_reference_pressure_pa,
-        scale_height_m=profile_scale_height_m)
+        scale_height_m=profile_scale_height_m,
+        target_pressure_pa=profile_target_pressure_pa)
               if profile else _horizontal(da, ds, target_time, target_lats, target_lons))
     return result, da
 
 
-def load_real_initialization(cfg, lats, lons, levels_m):
-    """Return model-shaped initial fields from configured NetCDF snapshots."""
+def load_real_initialization(cfg, lats, lons, levels_m,
+                             target_pressure_pa=None):
+    """Return model-shaped initial fields from configured NetCDF snapshots.
+
+    ``target_pressure_pa`` optionally gives the reference pressure of every
+    model layer; pressure-level data are then interpolated directly to it
+    instead of to a scale-height estimate from ``levels_m``.
+    """
     data_cfg = cfg.data
     atmosphere_paths = _as_paths(getattr(data_cfg, "atmosphere_file", ""))
     surface_paths = _as_paths(getattr(data_cfg, "surface_file", ""))
@@ -347,11 +360,17 @@ def load_real_initialization(cfg, lats, lons, levels_m):
         physics.dynamics.reference_surface_pressure_pa)
     scale_height_m = max(
         float(vertical.scale_height), float(vertical.scale_height_min_m))
-    target_pressure_pa = reference_pressure_pa * np.exp(
-        -np.asarray(levels_m, dtype=np.float64) / scale_height_m)
+    if target_pressure_pa is None:
+        target_pressure_pa = reference_pressure_pa * np.exp(
+            -np.asarray(levels_m, dtype=np.float64) / scale_height_m)
+    else:
+        target_pressure_pa = np.asarray(target_pressure_pa, dtype=np.float64)
+        if target_pressure_pa.shape != (len(levels_m),):
+            raise ValueError("target_pressure_pa must have one value per level")
     profile_options = {
         "profile_reference_pressure_pa": reference_pressure_pa,
         "profile_scale_height_m": scale_height_m,
+        "profile_target_pressure_pa": target_pressure_pa,
     }
     fields = {}
     try:

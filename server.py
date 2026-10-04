@@ -63,9 +63,11 @@ class LiveRecorder:
         }
         if getattr(model, "_primitive_enabled", False):
             manifest["dynamics_core"] = "primitive_equations"
+            manifest["vertical_coordinate"] = model.vertical_coordinate
+            manifest["hybrid_a_pa"] = model.hyai.tolist()
+            manifest["hybrid_b"] = model.hybi.tolist()
             manifest["sigma_interfaces"] = model.sigma_interfaces.tolist()
-            manifest["top_pressure_pa"] = float(
-                model.cfg.physics.dynamics.top_pressure_pa)
+            manifest["top_pressure_pa"] = float(model.top_pressure_pa)
         with open(os.path.join(self.run_dir, "manifest.json"), "w",
                   encoding="utf-8") as fp:
             json.dump(manifest, fp, ensure_ascii=False, indent=1)
@@ -478,6 +480,15 @@ def create_app(cfg, playback_dir=None):
                 "ocean_layer_available": hub._has_ocean_layers(hub.fields),
                 "recording": bool(hub.recorder and hub.recorder.enabled),
                 "recorded_frames": (hub.recorder.frame_count if hub.recorder else 0)}
+
+    @app.get("/api/diagnostics")
+    async def diagnostics():
+        if hub.model is None:
+            return {"available": False, "mode": hub.mode}
+        out = hub.model.energy_diagnostics()
+        out["step"] = int(hub.model.step_count)
+        out["time"] = hub.model.t.isoformat()
+        return out
 
     @app.get("/api/analyze")
     async def analyze(lat: float, lon: float):

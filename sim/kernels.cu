@@ -190,16 +190,56 @@ __global__ void divergence(
     out[base + i * nlon + j] = dudx + dvcdy * invcoslat[i];
 }
 
-// Flux-form transport in terrain-following sigma coordinates. Each thread
-// owns one [level, latitude, longitude] cell and applies both adjacent
-// interface fluxes directly, avoiding a Python loop over vertical interfaces.
+// Limited vertical slope of a layer field (zero at the two boundary layers).
+__device__ __forceinline__ float vertical_slope(
+    const float* __restrict__ field, int k, int nz, int cells, int col,
+    int limiter)
+{
+    if (limiter < 0 || k <= 0 || k >= nz - 1) return 0.0f;
+    float below = field[(k - 1) * cells + col];
+    float centre = field[k * cells + col];
+    float above = field[(k + 1) * cells + col];
+    return tvd_slope(centre - below, above - centre, limiter);
+}
+
+// Net vertical exchange for cell k from the two shared interface fluxes.
+// Positive interface flux is downward; face values are upstream-biased with
+// half a limited slope (first-order upstream when limiter < 0).
+__device__ __forceinline__ float vertical_exchange(
+    const float* __restrict__ field,
+    const float* __restrict__ interface_flux,
+    int k, int nz, int cells, int col, float dt, int limiter)
+{
+    float f = field[k * cells + col];
+    float total = 0.0f;
+    if (k < nz - 1) {
+        float flux = interface_flux[(k + 1) * cells + col];
+        float face = flux >= 0.0f
+            ? field[(k + 1) * cells + col]
+              - 0.5f * vertical_slope(field, k + 1, nz, cells, col, limiter)
+            : f + 0.5f * vertical_slope(field, k, nz, cells, col, limiter);
+        total += dt * flux * face;
+    }
+    if (k > 0) {
+        float flux = interface_flux[k * cells + col];
+        float face = flux >= 0.0f
+            ? f - 0.5f * vertical_slope(field, k, nz, cells, col, limiter)
+            : field[(k - 1) * cells + col]
+              + 0.5f * vertical_slope(field, k - 1, nz, cells, col, limiter);
+        total -= dt * flux * face;
+    }
+    return total;
+}
+
+// Flux-form transport in hybrid sigma-pressure layers. Each thread owns one
+// [level, latitude, longitude] cell and applies both adjacent interface
+// fluxes directly, avoiding a Python loop over vertical interfaces.
 __global__ void mass_transport(
     const float* __restrict__ field,
     const float* __restrict__ u,
     const float* __restrict__ v,
-    const float* __restrict__ mu_old,          // [nlat, nlon]
-    const float* __restrict__ mu_new,          // [nlat, nlon]
-    const float* __restrict__ sigma_thickness, // [nz]
+    const float* __restrict__ dp_old,          // [nz, nlat, nlon]
+    const float* __restrict__ dp_new,          // [nz, nlat, nlon]
     const float* __restrict__ div_mass,        // [nz, nlat, nlon]
     const float* __restrict__ interface_flux,  // [nz+1, nlat, nlon]
     const float* __restrict__ invdx,           // [nlat]
@@ -232,23 +272,13 @@ __global__ void mass_transport(
     float dfdx = uu > 0.0f ? (f - fw) * idx_ : (fe - f) * idx_;
     float dfdy = vv > 0.0f ? (f - fs) * invdy : (fn - f) * invdy;
     float advective = -(uu * dfdx + vv * dfdy);
-    float ds = sigma_thickness[k];
-    float mu0 = mu_old[col];
-    float numerator = mu0 * ds * f
-                    + dt * ds * (-f * div_mass[idx] + mu0 * advective);
+    float dp0 = dp_old[idx];
+    float numerator = dp0 * f
+                    + dt * (-f * div_mass[idx] + dp0 * advective);
+    numerator += vertical_exchange(field, interface_flux, k, nz, cells, col,
+                                   dt, -1);
 
-    if (k < nz - 1) {
-        float flux = interface_flux[(k + 1) * cells + col];
-        float upstream = flux >= 0.0f ? field[idx + cells] : f;
-        numerator += dt * flux * upstream;
-    }
-    if (k > 0) {
-        float flux = interface_flux[k * cells + col];
-        float upstream = flux >= 0.0f ? f : field[idx - cells];
-        numerator -= dt * flux * upstream;
-    }
-
-    float result = numerator / fmaxf(mu_new[col] * ds, 1.0f);
+    float result = numerator / fmaxf(dp_new[idx], 1.0f);
     if (diffusivity != 0.0f) {
         float lap = (fw + fe - 2.0f * f) * idx_ * idx_
                   + (fn + fs - 2.0f * f) * invdy * invdy;
@@ -257,15 +287,16 @@ __global__ void mass_transport(
     out[idx] = result;
 }
 
-// Hydrostatic integration in a sigma column. One thread owns one horizontal
-// column and walks from the surface to the model top.
+// Hydrostatic integration in a hybrid sigma-pressure column. One thread owns
+// one horizontal column and walks from the surface to the model top.
 __global__ void hydrostatic_column(
     const float* __restrict__ temperature,       // [nz, nlat, nlon]
     const float* __restrict__ humidity,          // [nz, nlat, nlon]
     const float* __restrict__ surface_pressure,  // [nlat, nlon]
-    const float* __restrict__ sigma_interfaces,  // [nz+1]
+    const float* __restrict__ hyai,              // [nz+1], Pa
+    const float* __restrict__ hybi,              // [nz+1]
     const float* __restrict__ surface_geopotential,
-    float top_pressure, float gas_constant,
+    float gas_constant,
     float* __restrict__ pressure_interfaces,
     float* __restrict__ pressure_layers,
     float* __restrict__ geopotential_layers,
@@ -276,16 +307,15 @@ __global__ void hydrostatic_column(
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= cells) return;
 
-    float mu = surface_pressure[col] - top_pressure;
+    float ps = surface_pressure[col];
     float phi_bottom = surface_geopotential[col];
-    pressure_interfaces[col] =
-        top_pressure + sigma_interfaces[0] * mu;
+    pressure_interfaces[col] = hyai[0] + hybi[0] * ps;
     geopotential_interfaces[col] = phi_bottom;
 
     for (int k = 0; k < nz; ++k) {
         int idx = k * cells + col;
-        float p_bottom = top_pressure + sigma_interfaces[k] * mu;
-        float p_upper = top_pressure + sigma_interfaces[k + 1] * mu;
+        float p_bottom = hyai[k] + hybi[k] * ps;
+        float p_upper = hyai[k + 1] + hybi[k + 1] * ps;
         float p_mid = 0.5f * (p_bottom + p_upper);
         float tv = temperature[idx] * (1.0f + 0.608f * humidity[idx]);
         float coefficient = gas_constant * tv;
@@ -404,14 +434,13 @@ __global__ void muscl_adv_diff(
     out[idx] = f + dt * (-scalar_div + f * velocity_div + K * lap);
 }
 
-// Mass-consistent MUSCL/TVD transport in terrain-following sigma layers.
+// Mass-consistent MUSCL/TVD transport in hybrid sigma-pressure layers.
 __global__ void muscl_mass_transport(
     const float* __restrict__ field,
     const float* __restrict__ u,
     const float* __restrict__ v,
-    const float* __restrict__ mu_old,
-    const float* __restrict__ mu_new,
-    const float* __restrict__ sigma_thickness,
+    const float* __restrict__ dp_old,
+    const float* __restrict__ dp_new,
     const float* __restrict__ div_mass,
     const float* __restrict__ interface_flux,
     const float* __restrict__ invdx,
@@ -452,19 +481,19 @@ __global__ void muscl_mass_transport(
     float sy_s = slope_y_at(field, base, i - 1, j, nlat, nlon, limiter);
     float sy_n = slope_y_at(field, base, i + 1, j, nlat, nlon, limiter);
 
-    float mass_e = 0.5f * (mu_old[col] * u[idx]
-                            + mu_old[col_e] * u[idx_e]);
-    float mass_w = 0.5f * (mu_old[col_w] * u[idx_w]
-                            + mu_old[col] * u[idx]);
+    float mass_e = 0.5f * (dp_old[idx] * u[idx]
+                            + dp_old[idx_e] * u[idx_e]);
+    float mass_w = 0.5f * (dp_old[idx_w] * u[idx_w]
+                            + dp_old[idx] * u[idx]);
     float state_e = mass_e >= 0.0f ? f + 0.5f * sx : fe - 0.5f * sx_e;
     float state_w = mass_w >= 0.0f ? fw + 0.5f * sx_w : f - 0.5f * sx;
 
     float mass_n = i + 1 < nlat
-        ? 0.5f * (mu_old[col] * v[idx] * coslat[i]
-                  + mu_old[col_n] * v[idx_n] * coslat[north]) : 0.0f;
+        ? 0.5f * (dp_old[idx] * v[idx] * coslat[i]
+                  + dp_old[idx_n] * v[idx_n] * coslat[north]) : 0.0f;
     float mass_s = i > 0
-        ? 0.5f * (mu_old[col_s] * v[idx_s] * coslat[south]
-                  + mu_old[col] * v[idx] * coslat[i]) : 0.0f;
+        ? 0.5f * (dp_old[idx_s] * v[idx_s] * coslat[south]
+                  + dp_old[idx] * v[idx] * coslat[i]) : 0.0f;
     float state_n = mass_n >= 0.0f ? f + 0.5f * sy : fn - 0.5f * sy_n;
     float state_s = mass_s >= 0.0f ? fs + 0.5f * sy_s : f - 0.5f * sy;
 
@@ -472,22 +501,12 @@ __global__ void muscl_mass_transport(
         + (mass_n * state_n - mass_s * state_s) * invdy * invcoslat[i];
     float face_mass_div = (mass_e - mass_w) * invdx[i]
         + (mass_n - mass_s) * invdy * invcoslat[i];
-    float ds = sigma_thickness[k];
-    float numerator = mu_old[col] * ds * f + dt * ds
+    float numerator = dp_old[idx] * f + dt
         * (-f * div_mass[idx] - scalar_div + f * face_mass_div);
+    numerator += vertical_exchange(field, interface_flux, k, nz, cells, col,
+                                   dt, limiter);
 
-    if (k < nz - 1) {
-        float flux = interface_flux[(k + 1) * cells + col];
-        float upstream = flux >= 0.0f ? field[idx + cells] : f;
-        numerator += dt * flux * upstream;
-    }
-    if (k > 0) {
-        float flux = interface_flux[k * cells + col];
-        float upstream = flux >= 0.0f ? f : field[idx - cells];
-        numerator -= dt * flux * upstream;
-    }
-
-    float result = numerator / fmaxf(mu_new[col] * ds, 1.0f);
+    float result = numerator / fmaxf(dp_new[idx], 1.0f);
     if (diffusivity != 0.0f) {
         float lap = (fw + fe - 2.0f * f) * invdx[i] * invdx[i]
                   + (fn + fs - 2.0f * f) * invdy * invdy;

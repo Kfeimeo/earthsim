@@ -153,6 +153,10 @@ class CudaKernelTests(unittest.TestCase):
         mu_new = (mu_old + rng.normal(0.0, 20.0, size=(nlat, nlon))).astype(
             np.float32)
         sigma_thickness = np.array([0.15, 0.20, 0.25, 0.40], np.float32)
+        dp_old = (sigma_thickness[:, None, None] * mu_old[None]).astype(
+            np.float32)
+        dp_new = (sigma_thickness[:, None, None] * mu_new[None]).astype(
+            np.float32)
         div_mass = rng.normal(0.0, 2.0e-3, size=shape).astype(np.float32)
         interface_flux = np.zeros((nz + 1, nlat, nlon), np.float32)
         interface_flux[1:-1] = rng.normal(
@@ -161,13 +165,12 @@ class CudaKernelTests(unittest.TestCase):
         dt = 20.0
 
         expected = mass_consistent_transport(
-            np, ops, field, u, v, mu_old, mu_new, sigma_thickness,
+            np, ops, field, u, v, dp_old, dp_new,
             div_mass, interface_flux, diffusivity, dt)
         actual = self.kernels.mass_transport(
             self.cp.asarray(field), self.cp.asarray(u), self.cp.asarray(v),
-            self.cp.asarray(mu_old), self.cp.asarray(mu_new),
-            self.cp.asarray(sigma_thickness), self.cp.asarray(div_mass),
-            self.cp.asarray(interface_flux),
+            self.cp.asarray(dp_old), self.cp.asarray(dp_new),
+            self.cp.asarray(div_mass), self.cp.asarray(interface_flux),
             self.cp.asarray(ops.invdx[:, 0]), ops.invdy,
             diffusivity, dt)
         np.testing.assert_allclose(
@@ -187,26 +190,29 @@ class CudaKernelTests(unittest.TestCase):
         field = rng.uniform(0.0, 1.0, size=shape).astype(np.float32)
         u = rng.normal(0.0, 8.0, size=shape).astype(np.float32)
         v = rng.normal(0.0, 8.0, size=shape).astype(np.float32)
-        mu_old = rng.uniform(75000.0, 95000.0, size=(nlat, nlon)).astype(
+        # Hybrid layers: a pure-pressure top layer above two sigma layers.
+        ps = rng.uniform(75000.0, 95000.0, size=(nlat, nlon)).astype(
             np.float32)
-        mu_new = (mu_old + rng.normal(
-            0.0, 10.0, size=(nlat, nlon))).astype(np.float32)
-        sigma = np.array([0.2, 0.3, 0.5], np.float32)
-        mass_u = mu_old[None, :, :] * u
-        mass_v = mu_old[None, :, :] * v
+        ps_new = (ps + rng.normal(0.0, 10.0, size=(nlat, nlon))).astype(
+            np.float32)
+        d_hyai = np.array([0.0, 6000.0, 14000.0], np.float32)[:, None, None]
+        d_hybi = np.array([0.3, 0.5, 0.0], np.float32)[:, None, None]
+        dp_old = (d_hyai + d_hybi * ps[None]).astype(np.float32)
+        dp_new = (d_hyai + d_hybi * ps_new[None]).astype(np.float32)
+        mass_u = dp_old * u
+        mass_v = dp_old * v
         div_mass = ops.finite_volume_divergence(mass_u, mass_v)
         interface_flux = np.zeros((nz + 1, nlat, nlon), np.float32)
         interface_flux[1:-1] = rng.normal(
             0.0, 0.01, size=(nz - 1, nlat, nlon)).astype(np.float32)
 
         expected = mass_consistent_transport(
-            np, ops, field, u, v, mu_old, mu_new, sigma, div_mass,
+            np, ops, field, u, v, dp_old, dp_new, div_mass,
             interface_flux, 0.0, 10.0)
         actual = self.kernels.mass_transport(
             self.cp.asarray(field), self.cp.asarray(u), self.cp.asarray(v),
-            self.cp.asarray(mu_old), self.cp.asarray(mu_new),
-            self.cp.asarray(sigma), self.cp.asarray(div_mass),
-            self.cp.asarray(interface_flux),
+            self.cp.asarray(dp_old), self.cp.asarray(dp_new),
+            self.cp.asarray(div_mass), self.cp.asarray(interface_flux),
             self.cp.asarray(ops.invdx[:, 0]), ops.invdy, 0.0, 10.0,
             scheme="muscl_tvd", limiter="mc",
             coslat=self.cp.asarray(ops.coslat[:, 0]),
@@ -249,16 +255,16 @@ class CudaKernelTests(unittest.TestCase):
             75000.0, 103000.0, size=(nlat, nlon)).astype(np.float32)
         surface_geopotential = rng.uniform(
             0.0, 30000.0, size=(nlat, nlon)).astype(np.float32)
-        sigma = np.array([1.0, 0.72, 0.45, 0.20, 0.0], np.float32)
-        top_pressure = 10000.0
+        hyai = np.array([0.0, 2800.0, 6500.0, 9000.0, 10000.0], np.float32)
+        hybi = np.array([1.0, 0.72, 0.42, 0.11, 0.0], np.float32)
 
         expected = hydrostatic_state(
-            np, temperature, humidity, surface_pressure, sigma,
-            top_pressure, surface_geopotential)
+            np, temperature, humidity, surface_pressure, hyai, hybi,
+            surface_geopotential)
         actual = self.kernels.hydrostatic_state(
             self.cp.asarray(temperature), self.cp.asarray(humidity),
-            self.cp.asarray(surface_pressure), self.cp.asarray(sigma),
-            top_pressure, self.cp.asarray(surface_geopotential), RD)
+            self.cp.asarray(surface_pressure), self.cp.asarray(hyai),
+            self.cp.asarray(hybi), self.cp.asarray(surface_geopotential), RD)
         for actual_field, expected_field in zip(actual, expected):
             np.testing.assert_allclose(
                 self.cp.asnumpy(actual_field), expected_field,

@@ -51,10 +51,12 @@ def test_sigma_boundaries_are_impermeable_and_transport_is_mass_consistent():
 
     ps_new = model.surface_pressure + model.dt * ps_t
     constant = np.full_like(model.T_layers, 7.0)
+    thickness = model.sigma_thickness[:, None, None]
     transported = mass_consistent_transport(
         xp, model.ops, constant, model.u_layers, model.v_layers,
-        model.surface_pressure - top, ps_new - top,
-        model.sigma_thickness, div_mass, flux, 0.0, model.dt)
+        thickness * (model.surface_pressure - top)[None],
+        thickness * (ps_new - top)[None],
+        div_mass, flux, 0.0, model.dt)
     np.testing.assert_allclose(transported, constant, rtol=2e-6, atol=2e-6)
 
 
@@ -85,22 +87,20 @@ def test_muscl_tvd_preserves_bounds_and_integrated_tracer_mass():
     field[..., 20:40] = 1.0
     u = np.full_like(field, 20.0)
     v = np.zeros_like(field)
-    mu = np.full((1, nlon), 90000.0, np.float32)
-    sigma = np.ones(1, np.float32)
-    div_mass = ops.finite_volume_divergence(
-        mu[None, :, :] * u, mu[None, :, :] * v)
+    mu = np.full((1, 1, nlon), 90000.0, np.float32)
+    div_mass = ops.finite_volume_divergence(mu * u, mu * v)
     vertical_flux = np.zeros((2, 1, nlon), np.float32)
     dt = 0.4 / (20.0 * float(ops.invdx[0, 0]))
-    initial_mass = float((mu[None, :, :] * field).sum())
+    initial_mass = float((mu * field).sum())
 
     for _ in range(20):
         field = mass_consistent_transport(
-            np, ops, field, u, v, mu, mu, sigma, div_mass,
+            np, ops, field, u, v, mu, mu, div_mass,
             vertical_flux, 0.0, dt)
 
     assert float(field.min()) >= -2.0e-7
     assert float(field.max()) <= 1.0 + 2.0e-7
-    final_mass = float((mu[None, :, :] * field).sum())
+    final_mass = float((mu * field).sum())
     np.testing.assert_allclose(final_mass, initial_mass, rtol=2e-7)
 
 

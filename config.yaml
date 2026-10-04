@@ -39,11 +39,29 @@ physics:
   # Active atmospheric dynamics
   dynamics:
     core: primitive_equations       # primitive_equations | shallow_water
-    top_pressure_pa: 10000.0
+    # Fixed-pressure model top. 3 hPa matches the CAM4 26-level grid; the
+    # hybrid coordinate below becomes pure pressure above 100 hPa.
+    top_pressure_pa: 300.0
     reference_surface_pressure_pa: 101300.0
-    min_surface_pressure_pa: 25000.0
+    # The smoothed terrain stays below ~5.5 km (~50 kPa); this bound only
+    # guards the hybrid layers against collapsing and should never trigger.
+    min_surface_pressure_pa: 45000.0
     max_surface_pressure_pa: 120000.0
     surface_pressure_diffusivity: 0.0
+    # Second-order divergence damping (fraction of the explicit limit).
+    divergence_damping_coeff: 0.05
+    # Global total-energy fixer and local frictional heating.
+    energy_fixer: true
+    frictional_heating: true
+    # Upper-level sponge: implicit Rayleigh friction on the eddy wind,
+    # stronger horizontal diffusion and divergence damping above 50 hPa.
+    upper_damping:
+      enabled: true
+      sponge_base_pressure_pa: 5000.0
+      rayleigh_tau_s: 86400.0
+      damp_zonal_mean: false
+      diffusion_multiplier: 4.0
+      divergence_damping_multiplier: 4.0
 
   # Core dynamics
   H0: 8000.0
@@ -184,7 +202,10 @@ physics:
     humidity_greenhouse_scale: 0.02
 
   moisture_transport:
-    subsidence_drying_coeff: 0.7
+    # The ad hoc divergence-proportional drying removes water and latent
+    # energy without a heat source. The primitive core resolves subsidence
+    # drying through vertical transport, so it is disabled here.
+    subsidence_drying_coeff: 0.0
     subsidence_divergence_max: 1.0e-4
     precip_cloud_diagnostic_scale_mmh: 2.0
     cloud_subsidence_scale: 1.5e5
@@ -220,13 +241,31 @@ physics:
     deep_visc: 2.0e+4
     deep_temp_min_k: 271.2
 
-  # Vertical atmospheric transport
+  # Vertical atmospheric grid
   vertical:
     enabled: true
-    # Nominal heights are used for initialization/data interpolation. During
-    # integration, geometric heights are diagnosed hydrostatically.
+    # hybrid: CAM-like sigma-pressure grid generated from the block below.
+    # Interface pressure is A + B*ps; B is 1 at the ground and 0 above
+    # transition_pressure_pa, so the upper levels are pure pressure surfaces
+    # and the sigma-coordinate pressure-gradient error over high terrain is
+    # confined to the lower troposphere. Nominal heights for display and data
+    # interpolation are derived from the standard atmosphere.
+    coordinate: hybrid
+    hybrid:
+      levels: 26                      # 26-30 recommended
+      transition_pressure_pa: 10000.0 # pure pressure above 100 hPa
+      top_layers: 7                   # stretched stratospheric layers
+      top_stretch: 5.0                # ln(p) spacing ratio at the top
+      surface_layers: 6               # geometrically refined PBL layers
+      surface_ratio: 0.7
+      sigma_exponent: 1.0
+      # Alternatively give explicit CAM-style coefficients (surface -> top,
+      # hyai in Pa); the generated grid is used when both lists are empty.
+      hyai: []
+      hybi: []
+    # Used only when coordinate is sigma: nominal heights and nz+1 sigma
+    # interfaces ordered surface -> model top.
     levels_m: [100,400,800,1300,2000,3000,4300,5800,7600,9800,12500,16000]
-    # Interfaces are ordered surface -> model top and must have nz+1 entries.
     sigma_interfaces: [1.0,0.975,0.94,0.90,0.85,0.78,0.68,0.56,0.43,0.30,0.19,0.09,0.0]
     lapse_rate: 0.0065
     tropopause_height_m: 11000.0
@@ -243,6 +282,21 @@ physics:
     diff_momentum: 12.0
     diff_heat: 8.0
     diff_moisture: 5.0
+
+  # Column physics: boundary-layer deposition of surface fluxes, radiative
+  # heating distribution, implicit vertical mixing of dry static energy and
+  # enthalpy-conserving dry convective adjustment.
+  column_physics:
+    pbl_depth_pa: 10000.0
+    radiative_top_pa: 15000.0
+    vertical_diffusion: true
+    pbl_diffusivity_m2s: 10.0
+    free_diffusivity_m2s: 0.2
+    diffusion_depth_pa: 15000.0
+    richardson_damping: 10.0
+    min_shear_squared_s2: 1.0e-6
+    dry_adjustment: true
+    dry_adjustment_passes: 2
 
   # Terrain effects
   topography:
