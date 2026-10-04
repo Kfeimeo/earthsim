@@ -33,6 +33,29 @@ DEFAULTS = {
             "min_surface_pressure_pa": 25000.0,
             "max_surface_pressure_pa": 120000.0,
             "surface_pressure_diffusivity": 0.0,
+            # Second-order divergence damping, dimensionless fraction of the
+            # explicit stability limit min(dx, dy)^2 / dt. Zero disables it.
+            "divergence_damping_coeff": 0.02,
+            # Global energy fixer: a uniform temperature increment restores
+            # the total energy that the discrete adiabatic dynamics lose.
+            "energy_fixer": True,
+            # The fixer's per-step increment (~1e-5 K) is below float32
+            # resolution of T, so it is accumulated in double precision and
+            # applied once it reaches this size.
+            "energy_fixer_min_increment_k": 1.0e-3,
+            # Kinetic energy removed by surface stress, the sponge and
+            # vertical mixing is returned locally as heat.
+            "frictional_heating": True,
+            "upper_damping": {
+                "enabled": True,
+                # Rayleigh friction, extra horizontal diffusion and extra
+                # divergence damping ramp up above this pressure.
+                "sponge_base_pressure_pa": 5000.0,
+                "rayleigh_tau_s": 86400.0,        # at the model top
+                "damp_zonal_mean": False,         # False: damp eddies only
+                "diffusion_multiplier": 4.0,      # relative to visc/diff_T
+                "divergence_damping_multiplier": 4.0,
+            },
         },
         "H0": 800.0, "g_eff": 9.8, "beta_T": 22.0, "tau_h": 43200.0,
         "drag_ocean_atmosphere": 4.0e-6,
@@ -171,8 +194,41 @@ DEFAULTS = {
             "deep_visc": 2.0e4,
             "deep_temp_min_k": 268.0,
         },
+        "column_physics": {
+            # Surface sensible/latent fluxes and near-surface longwave
+            # exchange are deposited over this e-folding pressure depth.
+            "pbl_depth_pa": 10000.0,
+            # Column shortwave absorption and OLR cooling are spread with
+            # mass weights over layers below this pressure.
+            "radiative_top_pa": 15000.0,
+            "vertical_diffusion": True,
+            "pbl_diffusivity_m2s": 10.0,
+            "free_diffusivity_m2s": 0.2,
+            "diffusion_depth_pa": 15000.0,
+            # K is divided by (1 + richardson_damping * Ri) for Ri > 0.
+            "richardson_damping": 10.0,
+            "min_shear_squared_s2": 1.0e-6,
+            "dry_adjustment": True,
+            "dry_adjustment_passes": 2,
+        },
         "vertical": {
             "enabled": True,
+            # sigma: levels_m/sigma_interfaces below define the grid.
+            # hybrid: a CAM-like sigma-pressure grid is generated from the
+            # hybrid block (or taken from explicit hyai/hybi lists) and the
+            # nominal heights are derived from the standard atmosphere.
+            "coordinate": "sigma",
+            "hybrid": {
+                "levels": 26,
+                "transition_pressure_pa": 10000.0,
+                "top_layers": 7,
+                "top_stretch": 5.0,
+                "surface_layers": 6,
+                "surface_ratio": 0.7,
+                "sigma_exponent": 1.0,
+                "hyai": [],
+                "hybi": [],
+            },
             "levels_m": [100.0, 1000.0, 3000.0, 6000.0, 10000.0],
             "sigma_interfaces": [1.0, 0.90, 0.65, 0.35, 0.12, 0.0],
             "lapse_rate": 0.0065,

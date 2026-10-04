@@ -40,9 +40,11 @@ def run_precompute(cfg, days=None, progress=True):
     }
     if getattr(model, "_primitive_enabled", False):
         manifest["dynamics_core"] = "primitive_equations"
+        manifest["vertical_coordinate"] = model.vertical_coordinate
+        manifest["hybrid_a_pa"] = model.hyai.tolist()
+        manifest["hybrid_b"] = model.hybi.tolist()
         manifest["sigma_interfaces"] = model.sigma_interfaces.tolist()
-        manifest["top_pressure_pa"] = float(
-            model.cfg.physics.dynamics.top_pressure_pa)
+        manifest["top_pressure_pa"] = float(model.top_pressure_pa)
 
     t0 = time.time()
     frame_iter = range(nframes)
