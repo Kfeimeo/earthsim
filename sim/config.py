@@ -179,6 +179,14 @@ DEFAULTS = {
         "ground_evap_exponent": 1.0,
         "ground_runoff_tau": 864000.0,
         "ground_runoff_exponent": 2.0,
+        # Lateral soil / shallow ground-water exchange D*lap(ground_water)
+        # between land cells, m^2/s; zero disables it. Physical values
+        # (< 1 m^2/s) are invisible on a 0.25 deg grid; a few hundred m^2/s
+        # smooths the field by about one cell per runoff time scale.
+        "ground_water_diffusivity": 0.0,
+        # Send runoff downslope to the neighbouring cell and on to the sea
+        # instead of removing it locally.
+        "river_routing": True,
         "mld": 40.0, "tau_ocean": 8.0e-7, "drag_ocean": 1.5e-6,
         "visc_ocean": 4.0e4,
         "ocean_transport": {

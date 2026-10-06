@@ -176,6 +176,89 @@ class MultilayerModelTests(unittest.TestCase):
 
         self.assertGreater(wet_fractional_loss, dry_fractional_loss)
 
+    def test_runoff_routing_targets_are_downhill_or_sinks(self):
+        model = EarthModel(small_config())
+        n = model.nlat * model.nlon
+        land = model.land.ravel() > 0.5
+        height = np.where(land, model.surface_height.ravel(), -1.0)
+        target = model.river_target
+        drains = land & (target < n)
+
+        self.assertTrue(land.any())
+        self.assertTrue(drains.any())
+        self.assertTrue(np.all(height[target[drains]] < height[drains]))
+        self.assertGreater(float(model.river_to_ocean.sum()), 0.0)
+        np.testing.assert_array_equal(
+            model.river_sink.ravel() > 0.5, land & ~drains)
+        self.assertFalse((model.river_sink.ravel() > 0.5)[~land].any())
+
+    def test_runoff_routing_conserves_water_and_reaches_the_sea(self):
+        cfg = small_config()
+        cfg["physics"].update(ground_water_capacity_mm=100.0,
+                              ground_runoff_tau=600.0)
+        model = EarthModel(cfg)
+        area = np.broadcast_to(model._cell_area_m2, model.land.shape)
+        land = model.land > 0.5
+        model.ground_water[...] = np.where(land, 110.0, 0.0)
+        before = float((model.ground_water.astype(np.float64) * area).sum())
+        zero = np.zeros_like(model.ground_water)
+
+        model._update_ground_water(zero, zero)
+
+        after = float((model.ground_water.astype(np.float64) * area).sum())
+        budget = model.energy_diagnostics()
+        to_sea = budget["river_discharge_to_ocean_m3_s"] * 1000.0 * model.dt
+        lost = budget["endorheic_drainage_m3_s"] * 1000.0 * model.dt
+        self.assertGreater(to_sea, 0.0)
+        np.testing.assert_allclose(before, after + to_sea + lost, rtol=1e-6)
+        # Every cell shed 10 mm overflow + 10 mm river loss; receiving land
+        # cells got it back and the coast delivered it to ocean cells.
+        self.assertTrue(np.all(model.ground_water[~land] == 0.0))
+        self.assertTrue(np.any(model.ground_water[land] > 90.0 + 1e-3))
+        self.assertTrue(np.any(model.river_flow[~land] > 0.0))
+        self.assertTrue(np.all(model.river_flow[land] > 0.0))
+        self.assertTrue(np.isfinite(model.fields_cpu()["river_flow"]).all())
+
+    def test_runoff_routing_can_be_disabled(self):
+        cfg = small_config()
+        cfg["physics"].update(ground_water_capacity_mm=100.0,
+                              river_routing=False)
+        model = EarthModel(cfg)
+        land = model.land > 0.5
+        model.ground_water[...] = np.where(land, 110.0, 0.0)
+        zero = np.zeros_like(model.ground_water)
+
+        model._update_ground_water(zero, zero)
+
+        self.assertTrue(np.all(model.ground_water <= 100.0))
+        self.assertTrue(np.all(model.river_flow[~land] == 0.0))
+
+    def test_ground_water_diffusion_conserves_and_smooths_on_land_only(self):
+        cfg = small_config()
+        cfg["physics"].update(ground_runoff_tau=1.0e30,
+                              ground_water_diffusivity=1.0e9)
+        model = EarthModel(cfg)
+        # The huge diffusivity must have been capped at the stability limit.
+        self.assertTrue(model.ground_water_diffusion_enabled)
+        self.assertLessEqual(float((model._gw_kx + model._gw_ky).max()), 0.25)
+        area = np.broadcast_to(model._cell_area_m2, model.land.shape)
+        land = model.land > 0.5
+        rng = np.random.default_rng(0)
+        model.ground_water[...] = np.where(
+            land, rng.uniform(0.0, 100.0, land.shape), 0.0).astype(np.float32)
+        before = float((model.ground_water.astype(np.float64) * area).sum())
+        spread_before = float(model.ground_water[land].std())
+        zero = np.zeros_like(model.ground_water)
+
+        for _ in range(5):
+            model._update_ground_water(zero, zero)
+
+        after = float((model.ground_water.astype(np.float64) * area).sum())
+        np.testing.assert_allclose(before, after, rtol=1e-5)
+        self.assertTrue(np.all(model.ground_water[~land] == 0.0))
+        self.assertTrue(np.all(model.ground_water >= 0.0))
+        self.assertLess(float(model.ground_water[land].std()), spread_before)
+
     def test_two_layer_ocean_exchanges_heat_conservatively(self):
         cfg = small_config()
         cfg["physics"]["ocean_layers"]["enabled"] = True

@@ -53,7 +53,11 @@ def analyze_point(fields, lats, lons, land, lat, lon):
     if is_land:
         if "ground_water" in fields:
             out["ground_water"] = round(g("ground_water"), 1)
+        if "river_flow" in fields:
+            out["river_flow"] = round(g("river_flow"), 1)
     else:
         out["sst"] = round(g("sst"), 1)
         out["current"] = round(float(np.hypot(g("uo"), g("vo"))), 2)
+        if "river_flow" in fields and g("river_flow") > 0:
+            out["river_inflow"] = round(g("river_flow"), 1)
     return out

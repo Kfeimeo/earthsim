@@ -87,6 +87,7 @@ class EarthModel:
               f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         stage_started = _time.perf_counter()
         self._init_terrain_dynamics()
+        self._init_land_hydrology()
         print(f"[startup] terrain dynamics initialized: "
               f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         stage_started = _time.perf_counter()
@@ -254,6 +255,84 @@ class EarthModel:
         self.terrain_slope_y = slope_y.astype(xp.float32)
         self.terrain_slope = xp.sqrt(self.terrain_slope_x ** 2
                                      + self.terrain_slope_y ** 2).astype(xp.float32)
+
+    def _init_land_hydrology(self):
+        """Pre-compute runoff routing targets and ground-water diffusion.
+
+        Routing: steepest descent over the four face neighbours of the
+        smoothed model terrain, the same surface that defines
+        ``terrain_slope_x/y``. The sea is treated as lying below every land
+        cell so coastal cells drain into the ocean. Land cells without a
+        lower neighbour are depressions; their runoff keeps the local
+        drainage rule and simply leaves the system.
+        """
+        xp, o, p = self.xp, self.ops, self.cfg.physics
+        nlat, nlon = self.nlat, self.nlon
+        n = nlat * nlon
+        self.river_routing_enabled = bool(p.river_routing)
+        self.river_flow = xp.zeros((nlat, nlon), xp.float32)
+        zero = xp.zeros((), xp.float64)
+        self._river_budget = {"river_discharge_to_ocean_m3_s": zero,
+                              "endorheic_drainage_m3_s": zero.copy()}
+        # True cell area in m^2. Routing moves water between whole cells, so
+        # conservation only needs one consistent area per cell.
+        coslat = to_cpu(o.coslat)[:, 0].astype(_np.float64)
+        area = coslat * A_EARTH * (2.0 * _np.pi / nlon) * float(o.dy)
+        self._cell_area_m2 = xp.asarray(area, dtype=xp.float64)[:, None]
+
+        land = to_cpu(self.land) > 0.5
+        terrain = (self.surface_height if bool(p.topography.enabled)
+                   else xp.maximum(self.elev, 0.0) * self.land)
+        height = _np.where(land, to_cpu(terrain), -1.0).astype(_np.float64)
+        dx = to_cpu(o.dx)[:, 0].astype(_np.float64)[:, None]
+        dy = float(o.dy)
+        index = _np.arange(n).reshape(nlat, nlon)
+        target = _np.full((nlat, nlon), n, dtype=_np.int64)   # n marks a sink
+        best = _np.zeros((nlat, nlon))
+
+        def from_south(a):   # same convention as Ops.shifty(a, 1)
+            return _np.concatenate([a[:1], a[:-1]])
+
+        def from_north(a):
+            return _np.concatenate([a[1:], a[-1:]])
+
+        neighbours = (
+            (_np.roll(height, -1, axis=1), _np.roll(index, -1, axis=1), dx),
+            (_np.roll(height, 1, axis=1), _np.roll(index, 1, axis=1), dx),
+            (from_north(height), from_north(index), dy),
+            (from_south(height), from_south(index), dy),
+        )
+        for nb_height, nb_index, dist in neighbours:
+            drop = (height - nb_height) / dist
+            better = land & (drop > best)
+            best = _np.where(better, drop, best)
+            target = _np.where(better, nb_index, target)
+        drains = land & (target < n)
+        target_is_land = land.ravel()[_np.minimum(target, n - 1)]
+        self.river_target = xp.asarray(target.ravel())
+        self.river_sink = xp.asarray((land & ~drains).astype(_np.float32))
+        self.river_to_ocean = xp.asarray(
+            (drains & ~target_is_land).astype(_np.float32))
+
+        # Explicit flux-form diffusion coefficients D*dt/dx^2, capped at half
+        # the stability limit so one diffusivity is safe at every latitude.
+        diffusivity = float(p.ground_water_diffusivity)
+        if diffusivity < 0:
+            raise ValueError(
+                "physics.ground_water_diffusivity must be non-negative")
+        self.ground_water_diffusion_enabled = diffusivity > 0.0
+        kx = diffusivity * self.dt * o.invdx ** 2
+        ky = diffusivity * self.dt * float(o.invdy) ** 2 * xp.ones_like(kx)
+        scale = xp.minimum(1.0, 0.25 / xp.maximum(kx + ky, 1.0e-30))
+        self._gw_kx = (kx * scale).astype(xp.float32)
+        self._gw_ky = (ky * scale).astype(xp.float32)
+        # Relative area of the face shared with the northern neighbour, and
+        # a mask removing the non-existent face south of the first row.
+        self._gw_face_north = (
+            0.5 * (o.coslat + o.shifty(o.coslat, -1))).astype(xp.float32)
+        south_face = _np.ones((nlat, 1), dtype=_np.float32)
+        south_face[0] = 0.0
+        self._gw_south_face_mask = xp.asarray(south_face)
 
     # ------------------------------------------------------------
     def _init_state(self):
@@ -823,7 +902,14 @@ class EarthModel:
         return ocean_evap + land_evap, land_evap
 
     def _update_ground_water(self, land_evap, precipitation_mm):
-        """Apply rain, evaporation and nonlinear river drainage on land."""
+        """Apply rain, evaporation, lateral exchange and drainage on land.
+
+        Runoff (overflow plus river loss) is routed downslope: it recharges
+        the ground water of the next cell down the terrain, or enters the
+        sea at the coast. ``river_flow`` holds the resulting discharge in
+        m^3/s, on land the flow leaving the cell and on ocean cells the
+        river inflow at the mouth.
+        """
         xp, p, dt = self.xp, self.cfg.physics, self.dt
         capacity = float(p.ground_water_capacity_mm)
         water = xp.maximum(
@@ -832,6 +918,8 @@ class EarthModel:
             - dt * land_evap,
             0,
         )
+        if self.ground_water_diffusion_enabled:
+            water = self._diffuse_ground_water(water)
 
         # Water above the reservoir capacity drains immediately. Below that
         # limit, exponent > 1 makes the relative loss rate grow with storage.
@@ -842,8 +930,54 @@ class EarthModel:
         river_loss = (dt * capacity / tau
                       * xp.clip(water / capacity, 0, 1) ** exponent)
         river_loss = xp.minimum(river_loss, water) * self.land
-        self.ground_water = (water - river_loss).astype(xp.float32)
-        self.runoff = ((overflow + river_loss) / dt * 3600.0).astype(xp.float32)
+        water = water - river_loss
+        runoff_mm = overflow + river_loss
+        if self.river_routing_enabled:
+            inflow_mm = self._route_runoff(runoff_mm)
+            water = water + inflow_mm * self.land
+            flow_mm = xp.where(self.land > 0.5, runoff_mm, inflow_mm)
+        else:
+            flow_mm = runoff_mm
+        self.ground_water = water.astype(xp.float32)
+        self.runoff = (runoff_mm / dt * 3600.0).astype(xp.float32)
+        self.river_flow = (flow_mm * self._cell_area_m2
+                           / (1000.0 * dt)).astype(xp.float32)
+
+    def _diffuse_ground_water(self, water):
+        """Conservative lateral exchange ``D lap(water)`` between land cells.
+
+        Flux form: water crossing a land-land face leaves one cell and
+        enters the other, so nothing crosses the coastline or is created.
+        Away from coasts this equals ``D * ops.lap`` with the cos(lat) area
+        metric; the coefficients were capped at the stability limit.
+        """
+        o, land = self.ops, self.land
+        fx = (self._gw_kx * (o.rollx(water, -1) - water)
+              * land * o.rollx(land, -1))
+        water = water + fx - o.rollx(fx, 1)
+        fy = (self._gw_ky * (o.shifty(water, -1) - water)
+              * land * o.shifty(land, -1) * self._gw_face_north)
+        south = o.shifty(fy, 1) * self._gw_south_face_mask
+        return water + (fy - south) * o.invcoslat
+
+    def _route_runoff(self, runoff_mm):
+        """Move this step's runoff (mm) to the downslope target of each cell.
+
+        Returns the water arriving in every cell in mm: on land it is added
+        to the ground-water store, on ocean cells it is the river discharge
+        into the sea. Runoff from depressions has no target and is counted
+        as endorheic drainage.
+        """
+        xp, n = self.xp, self.nlat * self.nlon
+        mass = (runoff_mm.astype(xp.float64) * self._cell_area_m2).ravel()
+        received = xp.bincount(self.river_target, weights=mass,
+                               minlength=n + 1)
+        received_cells = received[:n].reshape(self.nlat, self.nlon)
+        per_second = 1.0 / (1000.0 * self.dt)   # kg per step -> m^3/s
+        self._river_budget["river_discharge_to_ocean_m3_s"] = (
+            (received_cells * self.ocean).sum() * per_second)
+        self._river_budget["endorheic_drainage_m3_s"] = received[n] * per_second
+        return (received_cells / self._cell_area_m2).astype(xp.float32)
 
     def _update_cloud_cover(self, diagnostic_cloud, rh, div):
         """Relax cloud cover toward diagnostics and clear unsupported cloud."""
@@ -1912,6 +2046,7 @@ class EarthModel:
             "precip": to_cpu(self.precip),
             "ground_water": to_cpu(self.ground_water),
             "runoff": to_cpu(self.runoff),
+            "river_flow": to_cpu(self.river_flow),
             "ice": to_cpu(self.xp.maximum(self.ice, self.snow)),
             "u": to_cpu(self.u), "v": to_cpu(self.v),
             "w": to_cpu(self.w),
@@ -1990,6 +2125,8 @@ class EarthModel:
             gravity_wave_speed * self.dt * float(o.invdx.max()))
         out["limiter_counts"] = {
             key: int(value) for key, value in self._limiter_counts.items()}
+        for key, value in self._river_budget.items():
+            out[key] = float(value)
         out["available"] = True
         return out
 

@@ -110,6 +110,8 @@ physics:
   ground_evap_exponent: 1.0
   ground_runoff_tau: 864000.0
   ground_runoff_exponent: 2.0
+  ground_water_diffusivity: 0.0   # m^2/s, 陆地储水侧向扩散, 0 关闭
+  river_routing: true             # 径流沿地形坡度汇流入海
 
   # Idealized wind initialization
   ideal_wind_enabled: true
