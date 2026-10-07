@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 output/
 web/generated/
+data/era5_pressure_levels.nc
+data/era5_single_levels.nc
+data/etopo2022_60s.npz
+data/cmems_surface_currents.nc

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>EarthSim · 地球天气模拟</title>
-<link rel="stylesheet" href="/static/style.css?v=ui4">
+<link rel="stylesheet" href="/static/style.css?v=ui5">
 </head>
 <body>
 <canvas id="globe"></canvas>
@@ -21,6 +21,9 @@
 <aside id="panel-layers">
   <div class="panel-title">数据图层</div>
   <div id="layer-list"></div>
+  <div class="flow-layer level-row" id="wind-layer-row" title="气压、气温、水汽、风场与全局统计都按此高度显示">
+    <span>高度</span><select id="wind-layer"></select>
+  </div>
   <div class="panel-title" style="margin-top:14px">叠加</div>
   <label class="toggle"><input type="checkbox" id="tg-cloud" checked><span>云层覆盖</span></label>
   <label class="toggle"><input type="checkbox" id="tg-ice" checked><span>冰雪覆盖</span></label>
@@ -30,9 +33,6 @@
       <option value="vector">矢量图</option>
       <option value="streamline">流线图</option>
     </select>
-    <div class="flow-layer" id="wind-layer-row">
-      <span>高度</span><select id="wind-layer"></select>
-    </div>
     <div class="flow-density">
       <span>密度</span><input type="range" id="wind-density" min="1" max="10" step="1"><span class="mono" id="wind-density-label"></span>
     </div>
@@ -78,16 +78,28 @@
   </div>
 </aside>
 
-<div id="analysis-card" class="hidden">
-  <button id="card-close">×</button>
-  <div class="card-head">
-    <div class="card-icon" id="card-icon">☀️</div>
-    <div>
-      <div class="card-weather" id="card-weather">晴</div>
-      <div class="card-coord mono" id="card-coord"></div>
+<div id="hud-right">
+  <aside id="panel-stats">
+    <div class="panel-title">全局统计 · <span id="stats-level">近地面</span></div>
+    <div class="stats-grid mono">
+      <span class="h"></span><span class="h">最低</span><span class="h">均值</span><span class="h">最高</span>
+      <span class="k">气温 °C</span><span class="v" id="st-temp-min">–</span><span class="v" id="st-temp-mean">–</span><span class="v" id="st-temp-max">–</span>
+      <span class="k">气压 hPa</span><span class="v" id="st-press-min">–</span><span class="v" id="st-press-mean">–</span><span class="v" id="st-press-max">–</span>
+      <span class="k">风速 m/s</span><span class="v" id="st-wind-min">–</span><span class="v" id="st-wind-mean">–</span><span class="v" id="st-wind-max">–</span>
     </div>
+  </aside>
+
+  <div id="analysis-card" class="hidden">
+    <button id="card-close">×</button>
+    <div class="card-head">
+      <div class="card-icon" id="card-icon">☀️</div>
+      <div>
+        <div class="card-weather" id="card-weather">晴</div>
+        <div class="card-coord mono" id="card-coord"></div>
+      </div>
+    </div>
+    <div class="card-grid mono" id="card-grid"></div>
   </div>
-  <div class="card-grid mono" id="card-grid"></div>
 </div>
 
 <footer id="transport">
@@ -106,6 +118,6 @@
 
 <div id="hint">拖动旋转 · 滚轮缩放 · 点击地表查看天气</div>
 
-<script type="module" src="/static/app.js?v=ui5"></script>
+<script type="module" src="/static/app.js?v=ui6"></script>
 </body>
 </html>

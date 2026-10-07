@@ -2055,6 +2055,8 @@ class EarthModel:
         if include_layers:
             fields["u_layers"] = to_cpu(self.u_layers)
             fields["v_layers"] = to_cpu(self.v_layers)
+            fields["T_layers"] = to_cpu(self.T_layers)
+            fields["q_layers"] = to_cpu(self.q_layers)
             if self._primitive_enabled:
                 fields["pressure_layers_pa"] = to_cpu(
                     self.pressure_layers_pa)

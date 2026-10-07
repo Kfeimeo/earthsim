@@ -95,12 +95,40 @@ body {
 .legend-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--dim); margin-top: 3px; }
 #legend-name { color: var(--text); }
 
+/* ---- 大气高度选择 ---- */
+.level-row { margin: 6px 0 2px; padding: 6px 4px 2px; border-top: 1px solid var(--line); }
+.level-row span:first-child { color: var(--teal); letter-spacing: 0.08em; }
+.level-row select {
+  flex: 1; min-width: 0; background: #0d1420; color: #dbe6f2;
+  border: 1px solid #23324a; border-radius: 6px; padding: 4px 6px; font-size: 12px;
+}
+
+/* ---- 右侧: 全局统计 + 分析卡片 ---- */
+#hud-right {
+  position: fixed; right: 16px; top: 64px; width: 240px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+#panel-stats {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 14px; backdrop-filter: blur(8px);
+}
+#panel-stats .panel-title { margin-bottom: 6px; }
+#stats-level { color: var(--amber); letter-spacing: 0; }
+.stats-grid {
+  display: grid; grid-template-columns: auto 1fr 1fr 1fr; gap: 2px 8px;
+  font-size: 11.5px; align-items: baseline;
+}
+.stats-grid .h { color: var(--dim); font-size: 10px; text-align: right; }
+.stats-grid .k { color: var(--dim); white-space: nowrap; }
+.stats-grid .v { color: var(--amber); text-align: right; font-variant-numeric: tabular-nums; }
+
 /* ---- 分析卡片 ---- */
 #analysis-card {
-  position: fixed; right: 16px; top: 64px; width: 240px;
+  position: relative; width: 240px;
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 16px; backdrop-filter: blur(8px);
 }
+.card-grid .sect { grid-column: 1 / -1; color: var(--teal); font-size: 10.5px; letter-spacing: 0.12em; margin-top: 6px; }
 #card-close {
   position: absolute; right: 8px; top: 6px; background: none; border: none;
   color: var(--dim); font-size: 16px; cursor: pointer;

@@ -17,6 +17,7 @@ from sim.analysis import analyze_point
 from sim.backend import to_cpu
 from sim.model import EarthModel
 from sim.precompute import FramePlayer
+from sim.primitive import standard_atmosphere_height
 from sim import topo as _topo
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +29,64 @@ LAYER_RANGES = {
     "ice": (0.0, 1.0),
 }
 SCALARS = list(LAYER_RANGES.keys())
+# 随所选大气层次变化的标量 (第 0 层 = 海平面气压 / 近地面气温 / 近地面比湿)
+LEVEL_SCALARS = ("press", "temp", "hum")
+_ISA_SEA_LEVEL_HPA = 1013.25
+
+
+def standard_atmosphere_pressure_hpa(height_m):
+    """U.S. Standard Atmosphere 1976 pressure (hPa) at a geometric height."""
+    z = float(height_m)
+    if z < 11000.0:
+        return _ISA_SEA_LEVEL_HPA * (1.0 - 2.25577e-5 * z) ** 5.25588
+    if z < 20000.0:
+        return 226.32 * np.exp(-(z - 11000.0) / 6341.6)
+    return 54.75 * (1.0 + 4.6155e-6 * (z - 20000.0)) ** -34.163
+
+
+def level_display_ranges(height_m, reference_pressure_hpa=None):
+    """Display ranges for the level-dependent scalars of one model level.
+
+    The surface ranges are shifted with the standard atmosphere so that a
+    colormap stays informative at every level: pressure scales with the ISA
+    pressure, temperature follows the 6.5 K/km lapse up to the tropopause
+    and humidity decays with a 2.5 km scale height. When the layer's
+    reference pressure is known it defines the level (via the ISA height);
+    otherwise the nominal height is used.
+    """
+    if reference_pressure_hpa is not None and reference_pressure_hpa > 0:
+        p_ref = float(reference_pressure_hpa)
+        z = float(standard_atmosphere_height(p_ref * 100.0)[0])
+    else:
+        z = max(float(height_m), 0.0)
+        p_ref = standard_atmosphere_pressure_hpa(z)
+    z = max(z, 0.0)
+    p_lo, p_hi = LAYER_RANGES["press"]
+    scale = p_ref / _ISA_SEA_LEVEL_HPA
+    t_lo, t_hi = LAYER_RANGES["temp"]
+    shift = -0.0065 * min(z, 11000.0)
+    q_hi = LAYER_RANGES["hum"][1] * np.exp(-z / 2500.0)
+    q_hi = float(max(float(f"{q_hi:.2g}"), 0.05))
+    return {
+        "press": (round(p_lo * scale, 1), round(p_hi * scale, 1)),
+        "temp": (round(t_lo + shift), round(t_hi + shift)),
+        "hum": (0.0, q_hi),
+    }
+
+
+def global_field_stats(lats, temp, press, u, v):
+    """Area-weighted global extrema and means of the displayed level."""
+    w = np.cos(np.radians(np.asarray(lats, dtype=np.float64)))[:, None]
+    w = np.broadcast_to(w, temp.shape)
+    wsum = float(w.sum())
+    speed = np.hypot(np.asarray(u, np.float64), np.asarray(v, np.float64))
+
+    def stats(a):
+        a = np.asarray(a, dtype=np.float64)
+        return {"min": round(float(a.min()), 2), "max": round(float(a.max()), 2),
+                "mean": round(float((a * w).sum() / wsum), 2)}
+
+    return {"temp": stats(temp), "press": stats(press), "wind": stats(speed)}
 
 
 class LiveRecorder:
@@ -137,6 +196,7 @@ class Hub:
         self.vector_strides = {"wind": stride, "ocean": stride}
         self.wind_layer_index = 0
         self.ocean_layer_index = 0
+        self.level_fields = None
         if playback_dir:
             self.recorder = None
             self.player = FramePlayer(playback_dir)
@@ -234,6 +294,59 @@ class Hub:
             return f["u_layers"][k], f["v_layers"][k]
         return f["u"], f["v"]
 
+    def _has_layer_scalars(self, f):
+        if self.model is not None:
+            return True
+        return "T_layers" in f and "q_layers" in f
+
+    def _level_scalars(self, f):
+        """Pressure/temperature/humidity of the selected level + their ranges.
+
+        Level 0 keeps the surface products (reduced sea-level pressure, near
+        surface air temperature and humidity). Higher levels expose the model
+        layer itself: layer pressure in hPa, layer temperature in degC and
+        layer specific humidity in g/kg.
+        """
+        k = self._clip_atmosphere_layer(self.wind_layer_index)
+        out = {name: f[name] for name in LEVEL_SCALARS}
+        ranges = {name: LAYER_RANGES[name] for name in LEVEL_SCALARS}
+        if k == 0 or not self._has_layer_scalars(f):
+            return out, ranges
+        if self.model:
+            m = self.model
+            out["temp"] = to_cpu(m.T_layers[k]) - 273.15
+            out["hum"] = to_cpu(m.q_layers[k]) * 1000.0
+            if getattr(m, "_primitive_enabled", False):
+                out["press"] = to_cpu(m.pressure_layers_pa[k]) / 100.0
+        else:
+            out["temp"] = f["T_layers"][k] - 273.15
+            out["hum"] = f["q_layers"][k] * 1000.0
+            if "pressure_layers_pa" in f:
+                out["press"] = f["pressure_layers_pa"][k] / 100.0
+        levels = self._atmosphere_levels()
+        level_ranges = level_display_ranges(
+            levels[k] if k < len(levels) else 0.0,
+            self._level_reference_pressure_hpa(k))
+        if out["press"] is f["press"]:
+            level_ranges["press"] = LAYER_RANGES["press"]
+        ranges.update(level_ranges)
+        return out, ranges
+
+    def _level_reference_pressure_hpa(self, k):
+        """Reference-column pressure of layer k (hPa), or None if unknown."""
+        if self.model is not None:
+            ref = getattr(self.model, "reference_pressure_layers_pa", None)
+            if ref is not None and k < len(ref):
+                return float(ref[k]) / 100.0
+            return None
+        man = self.player.manifest
+        a, b = man.get("hybrid_a_pa"), man.get("hybrid_b")
+        if not a or not b or k + 1 >= len(a):
+            return None
+        ps = float(self.cfg.physics.dynamics.reference_surface_pressure_pa)
+        p_i = np.asarray(a, dtype=np.float64) + np.asarray(b, dtype=np.float64) * ps
+        return float(0.5 * (p_i[k] + p_i[k + 1])) / 100.0
+
     def _clip_ocean_layer(self, k):
         n = 2 if self._has_ocean_layers(self.fields) else 1
         return int(np.clip(int(k), 0, n - 1))
@@ -264,6 +377,16 @@ class Hub:
                 "ocean_layer_index": self._clip_ocean_layer(self.ocean_layer_index),
                 "ocean_layer_available": self._has_ocean_layers(f)}
         meta["atmosphere_levels_m"] = self._atmosphere_levels()
+        meta["atmosphere_layer_index"] = meta["wind_layer_index"]
+        meta["level_scalars_available"] = self._has_layer_scalars(f)
+        level_fields, level_ranges = self._level_scalars(f)
+        wind_u, wind_v = self._wind_components(f)
+        self.level_fields = dict(level_fields, u=wind_u, v=wind_v,
+                                 index=meta["wind_layer_index"])
+        meta["stats"] = global_field_stats(
+            self.lats, level_fields["temp"], level_fields["press"],
+            wind_u, wind_v)
+        meta["stats"]["layer"] = meta["wind_layer_index"]
         if self.mode == "playback":
             meta["frame"], meta["nframes"] = self.idx, self.player.n
             ss = f.get("subsolar")
@@ -277,8 +400,9 @@ class Hub:
             meta["recorded_frames"] = self.recorder.frame_count
         payload = bytearray()
         for name in SCALARS:
-            lo, hi = LAYER_RANGES[name]
-            a = np.clip((f[name] - lo) / (hi - lo), 0, 1)
+            lo, hi = level_ranges.get(name, LAYER_RANGES[name])
+            field = level_fields.get(name, f.get(name))
+            a = np.clip((field - lo) / (hi - lo), 0, 1)
             b = (a * 255).astype(np.uint8).tobytes()
             meta["layers"].append({"name": name, "off": len(payload),
                                    "len": len(b), "min": lo, "max": hi})
@@ -287,7 +411,7 @@ class Hub:
             stride = self.vector_strides.get(
                 name, self._clip_vector_stride(self.cfg.server.vector_stride))
             if name == "wind":
-                u, v = self._wind_components(f)
+                u, v = wind_u, wind_v
             else:
                 u, v = self._ocean_components(f)
             vec = np.stack([u[::stride, ::stride],
@@ -363,7 +487,8 @@ class Hub:
                 if name in self.vector_strides:
                     self.vector_strides[name] = stride
             await self.broadcast()
-        elif cmd == "set_wind_layer":
+        elif cmd in ("set_wind_layer", "set_atmosphere_layer"):
+            # 一个高度选择同时作用于风场与随高度变化的标量图层
             self.wind_layer_index = self._clip_atmosphere_layer(
                 msg.get("value", self.wind_layer_index))
             await self.broadcast()
@@ -475,7 +600,9 @@ def create_app(cfg, playback_dir=None):
                 "dt": float(cfg.time.dt),
                 "vector_strides": dict(hub.vector_strides),
                 "wind_layer_index": hub._clip_atmosphere_layer(hub.wind_layer_index),
+                "atmosphere_layer_index": hub._clip_atmosphere_layer(hub.wind_layer_index),
                 "wind_layer_available": hub._has_layer_winds(hub.fields),
+                "level_scalars_available": hub._has_layer_scalars(hub.fields),
                 "ocean_layer_index": hub._clip_ocean_layer(hub.ocean_layer_index),
                 "ocean_layer_available": hub._has_ocean_layers(hub.fields),
                 "recording": bool(hub.recorder and hub.recorder.enabled),
@@ -491,10 +618,32 @@ def create_app(cfg, playback_dir=None):
         return out
 
     @app.get("/api/analyze")
-    async def analyze(lat: float, lon: float):
+    async def analyze(lat: float, lon: float, layer: int = -1):
         try:
-            return analyze_point(hub.fields, hub.lats, hub.lons,
-                                 hub.land, lat, lon)
+            out = analyze_point(hub.fields, hub.lats, hub.lons,
+                                hub.land, lat, lon)
+            # 附带当前所选大气层次 (与画面上的图层/风场一致) 的要素
+            lf = hub.level_fields
+            if layer >= 0 and lf and lf.get("index") == hub._clip_atmosphere_layer(layer):
+                levels = hub._atmosphere_levels()
+                k = lf["index"]
+                i = int(np.clip(np.abs(hub.lats - out["lat"]).argmin(),
+                                0, len(hub.lats) - 1))
+                j = int(np.argmin(np.minimum(
+                    np.abs(hub.lons - out["lon"]),
+                    360 - np.abs(hub.lons - out["lon"]))))
+                u, v = float(lf["u"][i, j]), float(lf["v"][i, j])
+                out["level"] = {
+                    "index": k,
+                    "height_m": (round(float(levels[k])) if k < len(levels)
+                                 else None),
+                    "temp": round(float(lf["temp"][i, j]), 1),
+                    "pressure": round(float(lf["press"][i, j]), 1),
+                    "humidity": round(float(lf["hum"][i, j]), 2),
+                    "wind_speed": round(float(np.hypot(u, v)), 1),
+                    "wind_dir": round((np.degrees(np.arctan2(u, v)) + 360) % 360),
+                }
+            return out
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 

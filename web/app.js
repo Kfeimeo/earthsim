@@ -11,12 +11,13 @@ const THREE = await (async () => {
 })();
 
 // ---------------- 图层定义(色标须与着色器一致) ----------------
+// level: true 的图层随"高度"选择变化 (第 0 层为海平面气压/近地面气温/近地面水汽)
 const LAYERS = {
   none:   { label: "无叠加" },
-  press:  { label: "气压",  unit: "hPa",  cm: 1 },
-  temp:   { label: "气温",  unit: "°C",   cm: 2 },
+  press:  { label: "气压",  unit: "hPa",  cm: 1, level: true, surfaceLabel: "海平面气压" },
+  temp:   { label: "气温",  unit: "°C",   cm: 2, level: true },
   sst:    { label: "海温",  unit: "°C",   cm: 2, oceanOnly: true },
-  hum:    { label: "水汽",  unit: "g/kg", cm: 3 },
+  hum:    { label: "水汽",  unit: "g/kg", cm: 3, level: true },
   cloud:  { label: "云量",  unit: "",     cm: 4 },
   precip: { label: "降水",  unit: "mm/h", cm: 5 },
 };
@@ -442,7 +443,7 @@ async function refreshSelectedAnalysis(force = false) {
   const seq = ++analysisSeq;
   const { lat, lon } = selectedPoint;
   try {
-    const d = await (await fetch(`/api/analyze?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}`)).json();
+    const d = await (await fetch(`/api/analyze?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}&layer=${flowState.wind.layer}`)).json();
     if (seq === analysisSeq && selectedPoint) showCard(d);
   } catch (err) {
     console.warn("analyze failed", err);
@@ -464,8 +465,16 @@ function showCard(d) {
   if (d.river_inflow !== undefined) rows.push(["入海径流", d.river_inflow + " m³/s"]);
   if (d.sst !== undefined) rows.push(["海温", d.sst + " °C"], ["洋流", d.current + " m/s"]);
   if (d.ice > 0) rows.push(["冰雪", d.ice + " %"]);
+  // 所选高度 (非近地面) 的同点要素, 与画面上的图层/风场一致
+  const lv = d.level;
+  if (lv && lv.index > 0) {
+    rows.push(["__sect", `高度 ${lv.height_m !== null ? lv.height_m + " m" : "第 " + (lv.index + 1) + " 层"}`]);
+    rows.push(["气温", lv.temp + " °C"], ["气压", lv.pressure + " hPa"],
+      ["比湿", lv.humidity + " g/kg"], ["风", lv.wind_speed + " m/s / " + lv.wind_dir + "°"]);
+  }
   document.getElementById("card-grid").innerHTML =
-    rows.map(([k, v]) => `<span class="k">${k}</span><span class="v">${v}</span>`).join("");
+    rows.map(([k, v]) => k === "__sect" ? `<span class="sect">${v}</span>`
+      : `<span class="k">${k}</span><span class="v">${v}</span>`).join("");
   document.getElementById("analysis-card").classList.remove("hidden");
 }
 document.getElementById("card-close").onclick = () => {
@@ -507,6 +516,13 @@ function clampOceanLayer(k) {
   return Math.max(0, Math.min(oceanLayerCount() - 1, parseInt(k || 0)));
 }
 function formatWindLayerLabel(k) {
+  const z = atmosphereLevels[k];
+  const base = Number.isFinite(z) ? `${Math.round(z)} m` : `第 ${k + 1} 层`;
+  return k === 0 ? `${base} (近地面)` : base;
+}
+// 当前高度的简短说明, 用于图例与全局统计标题
+function levelTag(k) {
+  if (!k) return "近地面";
   const z = atmosphereLevels[k];
   return Number.isFinite(z) ? `${Math.round(z)} m` : `第 ${k + 1} 层`;
 }
@@ -645,11 +661,15 @@ setupFlowControls("wind");
 setupFlowControls("ocean");
 
 let lastFrame = null;
+// 上一帧的标量是否与当前高度选择一致 (切换高度后, 等待服务端返回新层的数据)
+function lastFrameMatchesLevel() {
+  return pendingWindLayer === null;
+}
 function refreshLayer() {
   const def = LAYERS[activeLayer];
   uniforms.cmap.value = def.cm || 0;
   uniforms.oceanOnly.value = def.oceanOnly ? 1 : 0;
-  if (lastFrame && def.cm) {
+  if (lastFrame && def.cm && (!def.level || lastFrameMatchesLevel())) {
     const L = lastFrame.layers.find(l => l.name === activeLayer);
     dataTex.image.data.set(lastFrame.bytes[activeLayer]);
     dataTex.needsUpdate = true;
@@ -662,9 +682,27 @@ function drawLegend(def, L) {
   if (def.cm) for (const [p, [r, gg, b]] of CM_STOPS[def.cm]) g.addColorStop(p, `rgb(${r},${gg},${b})`);
   else g.addColorStop(0, "#222"), g.addColorStop(1, "#222");
   c.fillStyle = g; c.fillRect(0, 0, 160, 10);
-  document.getElementById("legend-name").textContent = def.cm ? def.label + (def.unit ? ` (${def.unit})` : "") : "";
+  let name = "";
+  if (def.cm) {
+    const k = flowState.wind.layer;
+    name = def.level ? (k === 0 ? (def.surfaceLabel || def.label) : `${def.label} @${levelTag(k)}`) : def.label;
+    if (def.unit) name += ` (${def.unit})`;
+  }
+  document.getElementById("legend-name").textContent = name;
   document.getElementById("legend-min").textContent = L ? L.min : "";
   document.getElementById("legend-max").textContent = L ? L.max : "";
+}
+// ---------------- 全局统计 ----------------
+const fmt = (x, d) => (Number.isFinite(x) ? x.toFixed(d) : "–");
+function updateStats(m) {
+  const s = m.stats;
+  if (!s) return;
+  const k = Number.isInteger(s.layer) ? s.layer : flowState.wind.layer;
+  document.getElementById("stats-level").textContent = levelTag(k);
+  const put = (id, v, d) => { document.getElementById(id).textContent = fmt(v, d); };
+  put("st-temp-min", s.temp?.min, 1); put("st-temp-mean", s.temp?.mean, 1); put("st-temp-max", s.temp?.max, 1);
+  put("st-press-min", s.press?.min, 1); put("st-press-mean", s.press?.mean, 1); put("st-press-max", s.press?.max, 1);
+  put("st-wind-min", s.wind?.min, 1); put("st-wind-mean", s.wind?.mean, 1); put("st-wind-max", s.wind?.max, 1);
 }
 
 // ---------------- WebSocket ----------------
@@ -693,11 +731,14 @@ ws.onmessage = ev => {
 function render(m, windLayerMatchesSelection = true, oceanLayerMatchesSelection = true) {
   cloudTex.image.data.set(m.bytes.cloud); cloudTex.needsUpdate = true;
   iceTex.image.data.set(m.bytes.ice); iceTex.needsUpdate = true;
-  if (LAYERS[activeLayer].cm) {
+  const def = LAYERS[activeLayer];
+  // 随高度变化的标量 (气压/气温/水汽) 与风场、全局统计使用同一高度: 服务端尚未切到
+  // 所选层时, 保留旧画面, 避免出现"风是新层、气压是旧层"的不一致
+  if (def.cm && (!def.level || windLayerMatchesSelection)) {
     dataTex.image.data.set(m.bytes[activeLayer]); dataTex.needsUpdate = true;
-    drawLegend(LAYERS[activeLayer], m.layers.find(l => l.name === activeLayer));
+    drawLegend(def, m.layers.find(l => l.name === activeLayer));
   }
-  if (windLayerMatchesSelection) updateFlow("wind", m);
+  if (windLayerMatchesSelection) { updateFlow("wind", m); updateStats(m); }
   if (oceanLayerMatchesSelection) updateFlow("ocean", m);
   refreshSelectedAnalysis();
   // 太阳方向
