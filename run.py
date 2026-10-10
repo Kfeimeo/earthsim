@@ -4,6 +4,8 @@
   python run.py serve                       # 实时模拟 + 可视化
   python run.py serve --playback output/run1  # 回放预演算结果
   python run.py precompute --days 5         # 离线预演算
+  python run.py precompute --init-frame output/run1/frames/frame_000479.npz
+                                            # 从已保存的帧继续演算
   python run.py benchmark                   # 测试单步性能 (CPU/CUDA)
 """
 import argparse
@@ -17,6 +19,8 @@ def main():
     ap.add_argument("-c", "--config", default="config.yaml")
     ap.add_argument("--playback", default=None, help="回放目录 (serve 用)")
     ap.add_argument("--days", type=float, default=None, help="预演算天数")
+    ap.add_argument("--init-frame", default=None,
+                    help="预演算的初始帧文件 (覆盖 precompute.init_frame)")
     ap.add_argument("--port", type=int, default=None)
     args = ap.parse_args()
     print(f"[startup] arguments parsed: "
@@ -30,7 +34,7 @@ def main():
 
     if args.command == "precompute":
         from sim.precompute import run_precompute
-        run_precompute(cfg, days=args.days)
+        run_precompute(cfg, days=args.days, init_frame=args.init_frame)
 
     elif args.command == "benchmark":
         from sim.model import EarthModel

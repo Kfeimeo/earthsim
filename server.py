@@ -26,7 +26,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 LAYER_RANGES = {
     "press": (955.0, 1070.0), "temp": (-45.0, 45.0), "sst": (-4.0, 34.0),
     "hum": (0.0, 24.0), "cloud": (0.0, 1.0), "precip": (0.0, 1.2),
-    "ice": (0.0, 1.0),
+    "ice": (0.0, 1.0), "ground_water": (0.0, 150.0),
 }
 SCALARS = list(LAYER_RANGES.keys())
 # 随所选大气层次变化的标量 (第 0 层 = 海平面气压 / 近地面气温 / 近地面比湿)
@@ -87,6 +87,20 @@ def global_field_stats(lats, temp, press, u, v):
                 "mean": round(float((a * w).sum() / wsum), 2)}
 
     return {"temp": stats(temp), "press": stats(press), "wind": stats(speed)}
+
+
+def ground_water_stats(lats, land, ground_water):
+    """Area-weighted land statistics of the ground-water store (mm)."""
+    water = np.asarray(ground_water, dtype=np.float64)
+    w = np.cos(np.radians(np.asarray(lats, dtype=np.float64)))[:, None]
+    w = np.broadcast_to(w, water.shape) * (np.asarray(land) > 0.5)
+    wsum = float(w.sum())
+    if wsum <= 0.0:
+        return None
+    on_land = water[w > 0]
+    return {"min": round(float(on_land.min()), 2),
+            "max": round(float(on_land.max()), 2),
+            "mean": round(float((water * w).sum() / wsum), 2)}
 
 
 class LiveRecorder:
@@ -197,6 +211,11 @@ class Hub:
         self.wind_layer_index = 0
         self.ocean_layer_index = 0
         self.level_fields = None
+        # 储水图层的色标上限取配置的持水容量
+        self.layer_ranges = dict(LAYER_RANGES)
+        capacity = float(getattr(cfg.physics, "ground_water_capacity_mm", 0) or 0)
+        if capacity > 0:
+            self.layer_ranges["ground_water"] = (0.0, capacity)
         if playback_dir:
             self.recorder = None
             self.player = FramePlayer(playback_dir)
@@ -387,6 +406,10 @@ class Hub:
             self.lats, level_fields["temp"], level_fields["press"],
             wind_u, wind_v)
         meta["stats"]["layer"] = meta["wind_layer_index"]
+        if "ground_water" in f:
+            gw = ground_water_stats(self.lats, self.land, f["ground_water"])
+            if gw:
+                meta["stats"]["ground_water"] = gw
         if self.mode == "playback":
             meta["frame"], meta["nframes"] = self.idx, self.player.n
             ss = f.get("subsolar")
@@ -400,8 +423,10 @@ class Hub:
             meta["recorded_frames"] = self.recorder.frame_count
         payload = bytearray()
         for name in SCALARS:
-            lo, hi = level_ranges.get(name, LAYER_RANGES[name])
+            lo, hi = level_ranges.get(name, self.layer_ranges[name])
             field = level_fields.get(name, f.get(name))
+            if field is None:             # 旧回放帧没有该字段
+                continue
             a = np.clip((field - lo) / (hi - lo), 0, 1)
             b = (a * 255).astype(np.uint8).tobytes()
             meta["layers"].append({"name": name, "off": len(payload),
@@ -591,7 +616,7 @@ def create_app(cfg, playback_dir=None):
         levels = (hub.model.levels_m.tolist() if hub.model else
                   hub.player.manifest.get("atmosphere_levels_m", []))
         return {"mode": hub.mode, "shape": [len(hub.lats), len(hub.lons)],
-                "layers": SCALARS, "ranges": LAYER_RANGES,
+                "layers": SCALARS, "ranges": hub.layer_ranges,
                 "atmosphere_levels_m": levels,
                 "nframes": hub.player.n if hub.mode == "playback" else None,
                 "backend": hub.model.backend if hub.model else "playback",

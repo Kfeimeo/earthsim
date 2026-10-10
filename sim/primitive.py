@@ -229,10 +229,9 @@ def hybrid_mass_flux(xp, ops, u, v, surface_pressure, hyai, hybi):
     else:
         div_mass = ops.divergence(mass_u, mass_v)
     ps_tendency = -div_mass.sum(axis=0)
-    fluxes = [xp.zeros_like(surface_pressure)]
-    for k in range(u.shape[0]):
-        fluxes.append(fluxes[-1] + db[k] * ps_tendency + div_mass[k])
-    flux = xp.stack(fluxes, axis=0)
+    flux = xp.zeros((u.shape[0] + 1,) + surface_pressure.shape,
+                    dtype=div_mass.dtype)
+    xp.cumsum(db * ps_tendency + div_mass, axis=0, out=flux[1:])
     # Remove accumulated floating-point residue without changing the two
     # boundary values.  This is normally tiny but matters in long integrations.
     if u.shape[0] > 1:
@@ -356,6 +355,16 @@ def column_total_energy(xp, u, v, temperature, humidity, layer_mass,
     return column + surface_geopotential.astype(f64) * column_mass.astype(f64)
 
 
+def _column_kernels(xp, *arrays):
+    """The CUDA column kernels when they can take these arrays, else None."""
+    if getattr(xp, "__name__", "") != "cupy":
+        return None
+    from . import cuda_kernels
+    if cuda_kernels.load() and cuda_kernels.is_float32(*arrays):
+        return cuda_kernels
+    return None
+
+
 def implicit_vertical_diffusion(xp, field, layer_mass, exchange, dt):
     """Backward-Euler vertical diffusion with conservative interface exchange.
 
@@ -366,6 +375,10 @@ def implicit_vertical_diffusion(xp, field, layer_mass, exchange, dt):
     nz = field.shape[0]
     if nz < 2:
         return field
+    kernels = _column_kernels(xp, field, layer_mass, exchange)
+    if kernels is not None:
+        return kernels.vertical_diffusion(
+            [field], layer_mass, exchange, dt)[0]
     lower = [None] + [-dt * exchange[k - 1] for k in range(1, nz)]
     upper = [-dt * exchange[k] for k in range(nz - 1)] + [None]
     diag = []
@@ -400,6 +413,13 @@ def dry_convective_adjustment(xp, temperature, humidity, layer_mass,
     nz = temperature.shape[0]
     if nz < 2:
         return temperature, humidity
+    kernels = _column_kernels(
+        xp, temperature, layer_mass, exner_layers,
+        *(() if humidity is None else (humidity,)))
+    if kernels is not None:
+        return kernels.dry_adjustment(
+            temperature, humidity, layer_mass, exner_layers,
+            int(passes), float(threshold_k))
     T = list(temperature)
     q = None if humidity is None else list(humidity)
     for _ in range(int(passes)):

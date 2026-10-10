@@ -5,11 +5,14 @@ _module = None
 _adv_diff = None
 _muscl_adv_diff = None
 _gradient = None
+_laplacian = None
 _divergence = None
 _mass_transport = None
 _muscl_mass_transport = None
 _hydrostatic_column = None
 _polar_filter = None
+_vertical_diffusion = None
+_dry_adjustment = None
 _ADV_BLOCK = (16, 16)  # Must match the static shared-memory tile in kernels.cu.
 _POLAR_BLOCK = (256,)
 
@@ -18,6 +21,7 @@ def load():
     global _module, _adv_diff, _muscl_adv_diff, _gradient, _divergence
     global _mass_transport, _muscl_mass_transport
     global _hydrostatic_column, _polar_filter
+    global _vertical_diffusion, _dry_adjustment, _laplacian
     if _module is not None:
         return True
     try:
@@ -29,11 +33,15 @@ def load():
         _adv_diff = _module.get_function("adv_diff")
         _muscl_adv_diff = _module.get_function("muscl_adv_diff")
         _gradient = _module.get_function("gradient")
+        _laplacian = _module.get_function("laplacian")
         _divergence = _module.get_function("divergence")
         _mass_transport = _module.get_function("mass_transport")
         _muscl_mass_transport = _module.get_function("muscl_mass_transport")
         _hydrostatic_column = _module.get_function("hydrostatic_column")
         _polar_filter = _module.get_function("polar_filter")
+        _vertical_diffusion = _module.get_function(
+            "vertical_diffusion_column")
+        _dry_adjustment = _module.get_function("dry_adjustment_column")
         return True
     except Exception:
         _module = None
@@ -119,6 +127,20 @@ def gradient(F, invdx, invdy):
               (F, invdx, cp.float32(invdy), out_x, out_y,
                cp.int32(nlat), cp.int32(nlon)))
     return out_x, out_y
+
+
+def laplacian(F, invdx, invdy):
+    """Return the five-point Laplacian of a 2-D or batched float32 field."""
+    import cupy as cp
+    F, nlat, nlon, block, grid = _field_layout(cp, F)
+    invdx = cp.ascontiguousarray(invdx, dtype=cp.float32)
+    if invdx.size != nlat:
+        raise ValueError("invdx length must match the latitude dimension")
+    out = cp.empty_like(F)
+    _laplacian(grid, block,
+               (F, invdx, cp.float32(invdy), out,
+                cp.int32(nlat), cp.int32(nlon)))
+    return out
 
 
 def divergence(u, v, invdx, invdy, coslat, invcoslat):
@@ -241,6 +263,71 @@ def hydrostatic_state(temperature, humidity, surface_pressure,
          cp.int32(nz), cp.int32(cells)))
     return (pressure_interfaces, pressure_layers, geopotential_layers,
             geopotential_interfaces, virtual_temperature)
+
+
+def is_float32(*arrays):
+    """True when every array can be passed to the float32-only kernels."""
+    import cupy as cp
+    return all(isinstance(a, cp.ndarray) and a.dtype == cp.float32
+               for a in arrays)
+
+
+def _column_layout(cp, *arrays):
+    """Contiguous [level, lat, lon] arrays plus the per-column launch layout."""
+    arrays = [cp.ascontiguousarray(a) for a in arrays]
+    for array in arrays[1:]:
+        if array.shape[1:] != arrays[0].shape[1:]:
+            raise ValueError("column kernel arrays must share one grid")
+    cells = arrays[0].shape[-2] * arrays[0].shape[-1]
+    block = (256,)
+    return arrays, cells, block, ((cells + block[0] - 1) // block[0],)
+
+
+def vertical_diffusion(fields, layer_mass, exchange, dt):
+    """Implicit vertical diffusion of several [level, lat, lon] fields.
+
+    All fields share ``layer_mass`` and the interface ``exchange``.
+    """
+    import cupy as cp
+    (layer_mass, exchange, *fields), cells, block, grid = _column_layout(
+        cp, layer_mass, exchange, *fields)
+    nz = layer_mass.shape[0]
+    if exchange.shape[0] != nz - 1:
+        raise ValueError("exchange must have shape [nz-1, nlat, nlon]")
+    scratch = cp.empty_like(layer_mass)
+    results = []
+    for field in fields:
+        if field.shape != layer_mass.shape:
+            raise ValueError("field must match the layer mass shape")
+        out = cp.empty_like(field)
+        _vertical_diffusion(
+            grid, block,
+            (field, layer_mass, exchange, cp.float32(dt), scratch, out,
+             cp.int32(nz), cp.int32(cells)))
+        results.append(out)
+    return results
+
+
+def dry_adjustment(temperature, humidity, layer_mass, exner_layers,
+                   passes, threshold_k):
+    """Dry convective adjustment of every column; humidity may be None."""
+    import cupy as cp
+    has_q = humidity is not None
+    (temperature, layer_mass, exner_layers, humidity), cells, block, grid = (
+        _column_layout(cp, temperature, layer_mass, exner_layers,
+                       humidity if has_q else temperature))
+    if layer_mass.shape != temperature.shape \
+            or exner_layers.shape != temperature.shape \
+            or humidity.shape != temperature.shape:
+        raise ValueError("dry adjustment arrays must share one shape")
+    out_T = cp.empty_like(temperature)
+    out_q = cp.empty_like(temperature) if has_q else out_T
+    _dry_adjustment(
+        grid, block,
+        (temperature, humidity, layer_mass, exner_layers,
+         cp.float32(threshold_k), cp.int32(passes), cp.int32(has_q),
+         out_T, out_q, cp.int32(temperature.shape[0]), cp.int32(cells)))
+    return out_T, (out_q if has_q else None)
 
 
 def polar_filter(F, weights, passes):

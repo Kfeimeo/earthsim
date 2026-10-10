@@ -270,6 +270,71 @@ class CudaKernelTests(unittest.TestCase):
                 self.cp.asnumpy(actual_field), expected_field,
                 rtol=8e-6, atol=8e-2)
 
+    def test_laplacian_matches_numpy(self):
+        from sim.physics import Ops
+
+        rng = np.random.default_rng(23)
+        nlat, nlon = 9, 17
+        lats = -90.0 + (np.arange(nlat) + 0.5) * (180.0 / nlat)
+        ops = Ops(np, lats, nlon)
+        for shape in ((nlat, nlon), (3, nlat, nlon)):
+            field = rng.normal(280.0, 10.0, size=shape).astype(np.float32)
+            actual = self.kernels.laplacian(
+                self.cp.asarray(field), self.cp.asarray(ops.invdx[:, 0]),
+                float(ops.invdy))
+            expected = ops.lap(field)
+            np.testing.assert_allclose(
+                self.cp.asnumpy(actual), expected,
+                rtol=2e-4, atol=np.abs(expected).max() * 1e-5)
+
+    def test_vertical_diffusion_column_matches_numpy(self):
+        from sim.primitive import implicit_vertical_diffusion
+
+        rng = np.random.default_rng(29)
+        shape = (6, 9, 17)
+        field = rng.normal(280.0, 20.0, size=shape).astype(np.float32)
+        mass = rng.uniform(50.0, 800.0, size=shape).astype(np.float32)
+        exchange = rng.uniform(0.0, 3.0, size=(5, 9, 17)).astype(np.float32)
+
+        expected = implicit_vertical_diffusion(np, field, mass, exchange, 120.0)
+        actual = self.cp.asnumpy(implicit_vertical_diffusion(
+            self.cp, self.cp.asarray(field), self.cp.asarray(mass),
+            self.cp.asarray(exchange), 120.0))
+        np.testing.assert_allclose(actual, expected, rtol=5e-6)
+        np.testing.assert_allclose(
+            (mass * actual).sum(axis=0), (mass * field).sum(axis=0), rtol=5e-6)
+
+    def test_dry_adjustment_column_matches_numpy(self):
+        from sim.primitive import dry_convective_adjustment
+
+        rng = np.random.default_rng(31)
+        shape = (6, 9, 17)
+        exner = np.sort(rng.uniform(0.2, 1.0, size=shape), axis=0)[::-1]
+        exner = np.ascontiguousarray(exner, dtype=np.float32)
+        # Whole-kelvin potential temperatures keep every pair far from the
+        # instability threshold, so both backends take identical branches.
+        theta = rng.integers(290, 310, size=shape).astype(np.float32)
+        temperature = (theta * exner).astype(np.float32)
+        humidity = rng.uniform(0.0, 0.02, size=shape).astype(np.float32)
+        mass = rng.uniform(50.0, 800.0, size=shape).astype(np.float32)
+
+        for q in (humidity, None):
+            expected_T, expected_q = dry_convective_adjustment(
+                np, temperature, q, mass, exner, passes=2)
+            actual_T, actual_q = dry_convective_adjustment(
+                self.cp, self.cp.asarray(temperature),
+                None if q is None else self.cp.asarray(q),
+                self.cp.asarray(mass), self.cp.asarray(exner), passes=2)
+            self.assertFalse(np.array_equal(expected_T, temperature))
+            np.testing.assert_allclose(
+                self.cp.asnumpy(actual_T), expected_T, rtol=5e-6)
+            if q is None:
+                self.assertIsNone(actual_q)
+            else:
+                np.testing.assert_allclose(
+                    self.cp.asnumpy(actual_q), expected_q,
+                    rtol=5e-6, atol=1e-8)
+
 
 if __name__ == "__main__":
     unittest.main()

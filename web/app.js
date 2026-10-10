@@ -20,6 +20,7 @@ const LAYERS = {
   hum:    { label: "水汽",  unit: "g/kg", cm: 3, level: true },
   cloud:  { label: "云量",  unit: "",     cm: 4 },
   precip: { label: "降水",  unit: "mm/h", cm: 5 },
+  ground_water: { label: "地表储水", unit: "mm", cm: 6, landOnly: true },
 };
 // JS 侧色标(画图例用), 与 GLSL 同步
 const CM_STOPS = {
@@ -28,6 +29,7 @@ const CM_STOPS = {
   3: [[0,[20,26,38]],[0.4,[50,140,150]],[0.75,[80,190,230]],[1,[230,245,255]]],
   4: [[0,[15,18,26]],[1,[245,247,250]]],
   5: [[0,[15,18,26]],[0.25,[70,200,220]],[0.6,[60,110,230]],[1,[190,80,230]]],
+  6: [[0,[150,110,61]],[0.3,[199,191,110]],[0.6,[89,171,110]],[0.85,[41,120,191]],[1,[31,69,179]]],
 };
 
 // ---------------- 场景 ----------------
@@ -88,7 +90,7 @@ landTex.needsUpdate = true;
 const uniforms = {
   baseTex: { value: baseTex }, dataTex: { value: dataTex },
   cloudTex: { value: cloudTex }, iceTex: { value: iceTex }, landTex: { value: landTex },
-  cmap: { value: 0 }, oceanOnly: { value: 0 },
+  cmap: { value: 0 }, surfaceMask: { value: 0 },   // 0 全部 / 1 仅海洋 / 2 仅陆地
   showCloud: { value: 1.0 }, showIce: { value: 1.0 }, showNight: { value: 1.0 },
   sunDir: { value: new THREE.Vector3(1, 0, 0) },
 };
@@ -107,7 +109,7 @@ const globeMat = new THREE.ShaderMaterial({
     precision highp float;
     varying vec3 vN; varying vec3 vView;
     uniform sampler2D baseTex, dataTex, cloudTex, iceTex, landTex;
-    uniform int cmap, oceanOnly;
+    uniform int cmap, surfaceMask;
     uniform float showCloud, showIce, showNight;
     uniform vec3 sunDir;
     const float PI = 3.14159265;
@@ -123,6 +125,7 @@ const globeMat = new THREE.ShaderMaterial({
       if (id == 2) return vec4(ramp(t, vec3(.16,.16,.59), vec3(.27,.63,.86), vec3(.47,.82,.63), vec3(.96,.86,.35), vec3(.86,.20,.16), .3, .5, .7), 0.70);
       if (id == 3) return vec4(ramp(t, vec3(.08,.10,.15), vec3(.20,.55,.59), vec3(.31,.75,.90), vec3(.90,.96,1.0), vec3(.90,.96,1.0), .4, .75, .95), 0.20 + 0.62 * t);
       if (id == 4) return vec4(vec3(0.96), 0.85 * t);
+      if (id == 6) return vec4(ramp(t, vec3(.59,.43,.24), vec3(.78,.75,.43), vec3(.35,.67,.43), vec3(.16,.47,.75), vec3(.12,.27,.70), .3, .6, .85), 0.82);
       if (id == 5) return vec4(ramp(t, vec3(.06,.07,.10), vec3(.27,.78,.86), vec3(.24,.43,.90), vec3(.75,.31,.90), vec3(.75,.31,.90), .25, .6, .9), smoothstep(0.02, 0.3, t) * 0.9);
       return vec4(0.0);
     }
@@ -144,7 +147,9 @@ const globeMat = new THREE.ShaderMaterial({
         float t = texture2D(dataTex, uv).r;
         vec4 c = colormap(cmap, t);
         float m = c.a;
-        if (oceanOnly == 1) m *= 1.0 - step(0.5, texture2D(landTex, uv).r);
+        float isLand = step(0.5, texture2D(landTex, uv).r);
+        if (surfaceMask == 1) m *= 1.0 - isLand;
+        if (surfaceMask == 2) m *= isLand;
         col = mix(col, c.rgb, m);
       }
       // Linear opacity preserves a visible difference for every encoded cloud percent.
@@ -668,8 +673,8 @@ function lastFrameMatchesLevel() {
 function refreshLayer() {
   const def = LAYERS[activeLayer];
   uniforms.cmap.value = def.cm || 0;
-  uniforms.oceanOnly.value = def.oceanOnly ? 1 : 0;
-  if (lastFrame && def.cm && (!def.level || lastFrameMatchesLevel())) {
+  uniforms.surfaceMask.value = def.oceanOnly ? 1 : def.landOnly ? 2 : 0;
+  if (lastFrame && def.cm && lastFrame.bytes[activeLayer] && (!def.level || lastFrameMatchesLevel())) {
     const L = lastFrame.layers.find(l => l.name === activeLayer);
     dataTex.image.data.set(lastFrame.bytes[activeLayer]);
     dataTex.needsUpdate = true;
@@ -705,6 +710,51 @@ function updateStats(m) {
   put("st-wind-min", s.wind?.min, 1); put("st-wind-mean", s.wind?.mean, 1); put("st-wind-max", s.wind?.max, 1);
 }
 
+// ---------------- 地表储水统计 (陆地面积加权) + 均值时间序列 ----------------
+const GW_HISTORY_MAX = 1200;
+let gwHistory = [];            // [{ t: 模拟时间 ms, v: 陆地平均储水 mm }]
+function updateGroundWater(m) {
+  const g = m.stats?.ground_water;
+  document.getElementById("gw-stats").classList.toggle("hidden", !g);
+  if (!g) return;
+  const put = (id, v) => { document.getElementById(id).textContent = fmt(v, 1); };
+  put("st-gw-min", g.min); put("st-gw-mean", g.mean); put("st-gw-max", g.max);
+  const t = Date.parse(m.time + "Z");
+  const last = gwHistory[gwHistory.length - 1];
+  if (last && t < last.t) gwHistory = [];            // 重置 / 回放向前拖动
+  if (!last || t !== last.t) gwHistory.push({ t, v: g.mean });
+  // 超长时隔点抽稀, 保留完整时间跨度
+  if (gwHistory.length > GW_HISTORY_MAX) gwHistory = gwHistory.filter((_, i) => i % 2 === 0);
+  drawGroundWaterChart();
+}
+function drawGroundWaterChart() {
+  const cv = document.getElementById("gw-chart");
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const c = cv.getContext("2d");
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, w, h);
+  const n = gwHistory.length;
+  let lo = Infinity, hi = -Infinity;
+  for (const p of gwHistory) { lo = Math.min(lo, p.v); hi = Math.max(hi, p.v); }
+  const span = n ? gwHistory[n - 1].t - gwHistory[0].t : 0;
+  document.getElementById("gw-range").textContent = n ? `${lo.toFixed(1)} – ${hi.toFixed(1)} mm` : "";
+  document.getElementById("gw-span").textContent = span <= 0 ? ""
+    : span < 2 * 86400e3 ? `近 ${(span / 3600e3).toFixed(1)} 小时` : `近 ${(span / 86400e3).toFixed(1)} 天`;
+  if (n < 2 || span <= 0) return;
+  const pad = Math.max((hi - lo) * 0.12, 0.05);     // 变化很小时仍留出可读的纵向范围
+  const y0 = lo - pad, y1 = hi + pad, t0 = gwHistory[0].t;
+  const X = t => 1 + (t - t0) / span * (w - 2);
+  const Y = v => h - 2 - (v - y0) / (y1 - y0) * (h - 4);
+  c.beginPath();
+  gwHistory.forEach((p, i) => (i ? c.lineTo(X(p.t), Y(p.v)) : c.moveTo(X(p.t), Y(p.v))));
+  c.strokeStyle = "#5eead4"; c.lineWidth = 1.5; c.lineJoin = "round"; c.stroke();
+  c.lineTo(X(gwHistory[n - 1].t), h); c.lineTo(X(t0), h); c.closePath();
+  c.fillStyle = "rgba(94, 234, 212, 0.10)"; c.fill();
+}
+
 // ---------------- WebSocket ----------------
 const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
 ws.binaryType = "arraybuffer";
@@ -734,11 +784,12 @@ function render(m, windLayerMatchesSelection = true, oceanLayerMatchesSelection 
   const def = LAYERS[activeLayer];
   // 随高度变化的标量 (气压/气温/水汽) 与风场、全局统计使用同一高度: 服务端尚未切到
   // 所选层时, 保留旧画面, 避免出现"风是新层、气压是旧层"的不一致
-  if (def.cm && (!def.level || windLayerMatchesSelection)) {
+  if (def.cm && m.bytes[activeLayer] && (!def.level || windLayerMatchesSelection)) {
     dataTex.image.data.set(m.bytes[activeLayer]); dataTex.needsUpdate = true;
     drawLegend(def, m.layers.find(l => l.name === activeLayer));
   }
   if (windLayerMatchesSelection) { updateFlow("wind", m); updateStats(m); }
+  updateGroundWater(m);
   if (oceanLayerMatchesSelection) updateFlow("ocean", m);
   refreshSelectedAnalysis();
   // 太阳方向

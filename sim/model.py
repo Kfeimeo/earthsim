@@ -2068,6 +2068,63 @@ class EarthModel:
                 fields["vo_deep"] = to_cpu(self.vo_deep)
         return fields
 
+    def load_frame_state(self, fields, time):
+        """Replace the prognostic state with a frame saved by ``fields_cpu``.
+
+        The frame must hold the layer fields (``include_layers=True``) of a
+        primitive-equation run on the same grid. Diagnostic fields are
+        rebuilt from the restored state; vertical velocity stays zero until
+        the first step.
+        """
+        if not self._primitive_enabled:
+            raise ValueError(
+                "restarting from a frame requires the primitive-equation core")
+        xp, f32 = self.xp, self.xp.float32
+        shape2 = (self.nlat, self.nlon)
+        shape3 = (self.nz,) + shape2
+
+        def load(name, shape):
+            if name not in fields:
+                raise ValueError(f"frame has no '{name}' field")
+            value = _np.asarray(fields[name], dtype=_np.float32)
+            if value.shape != shape:
+                raise ValueError(
+                    f"frame field '{name}' has shape {value.shape}, "
+                    f"expected {shape}")
+            if not _np.isfinite(value).all():
+                raise ValueError(f"frame field '{name}' contains NaN/Inf")
+            return xp.asarray(value, dtype=f32)
+
+        state = {name: load(name, shape3) for name in (
+            "u_layers", "v_layers", "T_layers", "q_layers")}
+        state.update({name: load(name, shape2) for name in (
+            "surface_pressure_pa", "sst", "uo", "vo", "cloud", "precip",
+            "ground_water", "runoff", "river_flow")})
+        if self.ocean_layers_enabled:
+            state.update({name: load(name, shape2) for name in (
+                "sst_deep", "uo_deep", "vo_deep")})
+            self.To_deep = state["sst_deep"] + f32(273.15)
+            self.uo_deep, self.vo_deep = state["uo_deep"], state["vo_deep"]
+
+        self.u_layers, self.v_layers = state["u_layers"], state["v_layers"]
+        self.T_layers, self.q_layers = state["T_layers"], state["q_layers"]
+        self.surface_pressure = state["surface_pressure_pa"]
+        self.Ts = state["sst"] + f32(273.15)
+        self.uo, self.vo = state["uo"], state["vo"]
+        self.cloud, self.precip = state["cloud"], state["precip"]
+        self.ground_water = state["ground_water"]
+        self.runoff, self.river_flow = state["runoff"], state["river_flow"]
+
+        self.w_layers = xp.zeros(shape3, f32)
+        self.omega_layers = xp.zeros(shape3, f32)
+        self.sigma_dot_interfaces = xp.zeros((self.nz + 1,) + shape2, f32)
+        self._energy_fixer_debt_k = xp.zeros((), dtype=xp.float64)
+        self._refresh_primitive_diagnostics()
+        self._sync_surface_views()
+        self._diag_surface()
+        self.t = time
+        self.initialization_source = "frame"
+
     def atmosphere_column_cpu(self, lat_index=None, lon_index=None):
         """Export all vertical levels, or one grid-column, for diagnostics."""
         selector = ((slice(None), slice(None), slice(None)) if lat_index is None

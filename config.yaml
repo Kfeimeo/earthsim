@@ -6,15 +6,15 @@
 backend: cuda            # auto | cuda | cpu
 
 grid:
-  nlat: 720              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
-  nlon: 1440             # usually nlat*2
+  nlat: 90              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
+  nlon: 180             # usually nlat*2
   topo_file: data/etopo2022_60s.npz
   topo_files:
     - data/etopo2022_60s.npz
     - data/etopo20.npz
 
 time:
-  dt: 5
+  dt: 120
   start: "2026-05-01T00:00:00"
   spinup_days: 0
 
@@ -336,9 +336,13 @@ numerics:
   polar_divergence_damping_m2s: 2.0e5
 
 precompute:
-  out_dir: output/run1
-  days: 1
-  save_every_steps: 60
+  out_dir: output/run2
+  days: 10
+  save_every_steps: 15
+  # 从已保存的帧文件继续演算 (如 output/run1/frames/frame_000479.npz);
+  # 留空则按 data.init_mode 初始化。也可用命令行 --init-frame 指定。
+  # 帧所在目录的 manifest.json 必须与当前网格/垂直层配置一致。
+  init_frame: ""
 
 server:
   host: 0.0.0.0
@@ -350,3 +354,4 @@ server:
   record_enabled: false
   record_dir: output/recordings
   record_every_steps: 600
+

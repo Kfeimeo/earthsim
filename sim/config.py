@@ -285,7 +285,7 @@ DEFAULTS = {
                  "cos_clamp": 0.2,
                  "polar_filter_lat": 65.0, "polar_filter_passes": 6},
     "precompute": {"out_dir": "output/run1", "days": 3,
-                   "save_every_steps": 15},
+                   "save_every_steps": 15, "init_frame": ""},
     "server": {"host": "0.0.0.0", "port": 8000, "steps_per_frame": 3,
                "max_fps": 10, "vector_stride": 5, "basemap_width": 2160,
                "record_enabled": True, "record_dir": "output/recordings",

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>EarthSim · 地球天气模拟</title>
-<link rel="stylesheet" href="/static/style.css?v=ui5">
+<link rel="stylesheet" href="/static/style.css?v=ui7">
 </head>
 <body>
 <canvas id="globe"></canvas>
@@ -87,6 +87,15 @@
       <span class="k">气压 hPa</span><span class="v" id="st-press-min">–</span><span class="v" id="st-press-mean">–</span><span class="v" id="st-press-max">–</span>
       <span class="k">风速 m/s</span><span class="v" id="st-wind-min">–</span><span class="v" id="st-wind-mean">–</span><span class="v" id="st-wind-max">–</span>
     </div>
+    <div id="gw-stats" class="hidden">
+      <div class="panel-title">地表储水 · <span class="stats-tag">陆地</span></div>
+      <div class="stats-grid mono">
+        <span class="h"></span><span class="h">最低</span><span class="h">均值</span><span class="h">最高</span>
+        <span class="k">储水 mm</span><span class="v" id="st-gw-min">–</span><span class="v" id="st-gw-mean">–</span><span class="v" id="st-gw-max">–</span>
+      </div>
+      <canvas id="gw-chart" title="陆地平均储水随模拟时间的变化"></canvas>
+      <div class="legend-labels mono"><span id="gw-span"></span><span id="gw-range"></span></div>
+    </div>
   </aside>
 
   <div id="analysis-card" class="hidden">
@@ -118,6 +127,6 @@
 
 <div id="hint">拖动旋转 · 滚轮缩放 · 点击地表查看天气</div>
 
-<script type="module" src="/static/app.js?v=ui6"></script>
+<script type="module" src="/static/app.js?v=ui7"></script>
 </body>
 </html>

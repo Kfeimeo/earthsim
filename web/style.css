@@ -44,7 +44,13 @@ body {
   position: fixed; left: 16px; top: 64px; width: 172px;
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 14px; backdrop-filter: blur(8px);
+  /* 内容超出视口高度时在面板内垂直滚动 */
+  max-height: calc(100vh - 80px); overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-width: thin; scrollbar-color: rgba(94, 234, 212, 0.35) transparent;
 }
+#panel-layers::-webkit-scrollbar { width: 6px; }
+#panel-layers::-webkit-scrollbar-thumb { background: rgba(94, 234, 212, 0.35); border-radius: 3px; }
+#panel-layers::-webkit-scrollbar-thumb:hover { background: rgba(94, 234, 212, 0.6); }
 .panel-title { font-size: 11px; letter-spacing: 0.18em; color: var(--dim); margin-bottom: 8px; }
 .layer-btn {
   display: block; width: 100%; text-align: left;
@@ -121,6 +127,9 @@ body {
 .stats-grid .h { color: var(--dim); font-size: 10px; text-align: right; }
 .stats-grid .k { color: var(--dim); white-space: nowrap; }
 .stats-grid .v { color: var(--amber); text-align: right; font-variant-numeric: tabular-nums; }
+#gw-stats { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.stats-tag { color: var(--amber); letter-spacing: 0; }
+#gw-chart { display: block; width: 100%; height: 46px; margin-top: 8px; }
 
 /* ---- 分析卡片 ---- */
 #analysis-card {

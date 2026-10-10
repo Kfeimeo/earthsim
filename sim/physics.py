@@ -117,6 +117,9 @@ class Ops:
         return self.ddx(u) + self.ddy(v * self.coslat) * self.invcoslat
 
     def lap(self, F):
+        if self.cuda_adv is not None and F.dtype == self.xp.float32:
+            return self.cuda_adv.laplacian(
+                F, self.invdx_flat, float(self.invdy))
         return ((self.rollx(F, 1) + self.rollx(F, -1) - 2 * F) * self.invdx ** 2
                 + (self.shifty(F, 1) + self.shifty(F, -1) - 2 * F) * self.invdy ** 2)
 

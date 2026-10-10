@@ -116,6 +116,28 @@ __global__ void adv_diff(
     out[idx] = f + dt * (-uu * dfdx - vv * dfdy + K * lap);
 }
 
+// Five-point horizontal Laplacian for a 2-D field or a batch of fields.
+__global__ void laplacian(
+    const float* __restrict__ F,
+    const float* __restrict__ invdx,   // [nlat]
+    float invdy,
+    float* __restrict__ out,
+    int nlat, int nlon)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= nlat || j >= nlon) return;
+    int base = blockIdx.z * nlat * nlon;
+
+    float f = F[base + i * nlon + j];
+    float fw = load_clamped_wrapped(F, base, i, j - 1, nlat, nlon);
+    float fe = load_clamped_wrapped(F, base, i, j + 1, nlat, nlon);
+    float fs = load_clamped_wrapped(F, base, i - 1, j, nlat, nlon);
+    float fn = load_clamped_wrapped(F, base, i + 1, j, nlat, nlon);
+    out[base + i * nlon + j] = (fw + fe - 2.f * f) * invdx[i] * invdx[i]
+                             + (fs + fn - 2.f * f) * invdy * invdy;
+}
+
 // Centred horizontal gradient for a 2-D field or a batch of fields.
 __global__ void gradient(
     const float* __restrict__ F,
@@ -328,6 +350,90 @@ __global__ void hydrostatic_column(
         pressure_interfaces[(k + 1) * cells + col] = p_upper;
         geopotential_interfaces[(k + 1) * cells + col] = phi_upper;
         phi_bottom = phi_upper;
+    }
+}
+
+// Backward-Euler vertical diffusion. One thread owns one column and solves
+// its tridiagonal system with the Thomas algorithm; exchange[k] couples the
+// layers k and k+1. `diag` is [nz, nlat, nlon] scratch for the eliminated
+// diagonal, `out` holds the right-hand side until back substitution.
+__global__ void vertical_diffusion_column(
+    const float* __restrict__ field,       // [nz, nlat, nlon]
+    const float* __restrict__ layer_mass,  // [nz, nlat, nlon]
+    const float* __restrict__ exchange,    // [nz-1, nlat, nlon]
+    float dt,
+    float* __restrict__ diag,
+    float* __restrict__ out,
+    int nz, int cells)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cells) return;
+
+    float mass = layer_mass[col];
+    float d_prev = mass + dt * exchange[col];
+    float r_prev = mass * field[col];
+    diag[col] = d_prev;
+    out[col] = r_prev;
+    for (int k = 1; k < nz; ++k) {
+        int idx = k * cells + col;
+        float below = dt * exchange[idx - cells];
+        float above = (k < nz - 1) ? dt * exchange[idx] : 0.0f;
+        float w = -below / d_prev;
+        mass = layer_mass[idx];
+        d_prev = mass + below + above + w * below;
+        r_prev = mass * field[idx] - w * r_prev;
+        diag[idx] = d_prev;
+        out[idx] = r_prev;
+    }
+
+    float x = r_prev / d_prev;
+    out[(nz - 1) * cells + col] = x;
+    for (int k = nz - 2; k >= 0; --k) {
+        int idx = k * cells + col;
+        x = (out[idx] + dt * exchange[idx] * x) / diag[idx];
+        out[idx] = x;
+    }
+}
+
+// Enthalpy-conserving dry convective adjustment. One thread sweeps one
+// column upward `passes` times, mixing each statically unstable layer pair.
+__global__ void dry_adjustment_column(
+    const float* __restrict__ temperature,  // [nz, nlat, nlon]
+    const float* __restrict__ humidity,     // [nz, nlat, nlon] if has_q
+    const float* __restrict__ layer_mass,   // [nz, nlat, nlon]
+    const float* __restrict__ exner,        // [nz, nlat, nlon]
+    float threshold, int passes, int has_q,
+    float* __restrict__ out_T,
+    float* __restrict__ out_q,
+    int nz, int cells)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cells) return;
+
+    for (int k = 0; k < nz; ++k) {
+        int idx = k * cells + col;
+        out_T[idx] = temperature[idx];
+        if (has_q) out_q[idx] = humidity[idx];
+    }
+    for (int pass = 0; pass < passes; ++pass) {
+        for (int k = 0; k < nz - 1; ++k) {
+            int lo = k * cells + col;
+            int hi = lo + cells;
+            float t_lo = out_T[lo], t_hi = out_T[hi];
+            float ex_lo = exner[lo], ex_hi = exner[hi];
+            if (!(t_lo / ex_lo > t_hi / ex_hi + threshold)) continue;
+            float m_lo = layer_mass[lo], m_hi = layer_mass[hi];
+            float theta = (m_lo * t_lo + m_hi * t_hi)
+                        / (m_lo * ex_lo + m_hi * ex_hi);
+            out_T[lo] = theta * ex_lo;
+            out_T[hi] = theta * ex_hi;
+            if (has_q) {
+                float q_mixed = (m_lo * out_q[lo] + m_hi * out_q[hi])
+                              / (m_lo + m_hi);
+                out_q[lo] = q_mixed;
+                out_q[hi] = q_mixed;
+            }
+        }
     }
 }
 
