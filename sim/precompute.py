@@ -10,6 +10,7 @@ import time
 import numpy as np
 
 from .model import EarthModel
+from .regrid import Regridder
 
 
 try:
@@ -64,9 +65,10 @@ def run_precompute(cfg, days=None, progress=True):
         )
         frame_iter = progress_bar
 
+    full_state = bool(pc.get("save_full_state", False))
     for k in frame_iter:
         model.step(save_every)
-        f = model.fields_cpu(include_layers=True)
+        f = model.fields_cpu(include_layers=True, full_state=full_state)
         np.savez_compressed(
             os.path.join(frames_dir, f"frame_{k:06d}.npz"),
             **{key: v.astype(np.float32) for key, v in f.items()},
@@ -95,21 +97,66 @@ def run_precompute(cfg, days=None, progress=True):
     return out_dir
 
 
-class FramePlayer:
-    """回放器: 惰性加载 + 小缓存。"""
+def load_frame_file(path):
+    """Load one frame ``.npz`` (or the last frame of a run directory)."""
+    if os.path.isdir(path):
+        frames_dir = os.path.join(path, "frames")
+        candidates = sorted(
+            name for name in os.listdir(frames_dir)
+            if name.startswith("frame_") and name.endswith(".npz")
+        ) if os.path.isdir(frames_dir) else []
+        if not candidates:
+            raise FileNotFoundError(f"no frames found in {path}")
+        path = os.path.join(frames_dir, candidates[-1])
+    with np.load(path) as z:
+        return {key: z[key] for key in z.files}
 
-    def __init__(self, run_dir):
+
+def load_manifest_for_frame(path):
+    """Return the manifest next to a frame file or run directory, if any."""
+    run_dir = path if os.path.isdir(path) else os.path.dirname(
+        os.path.dirname(os.path.abspath(path)))
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        return {}
+    with open(manifest_path, encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+class FramePlayer:
+    """回放器: 惰性加载 + 小缓存。
+
+    ``target_shape`` (nlat, nlon) plays a recording on a different grid:
+    frames are aggregated (coarser target) or interpolated (finer target)
+    on load, so one recording can be viewed at any configured resolution.
+    """
+
+    def __init__(self, run_dir, target_shape=None):
         self.dir = run_dir
         with open(os.path.join(run_dir, "manifest.json"), encoding="utf-8") as fp:
             self.manifest = json.load(fp)
         self.n = len(self.manifest["times"])
         self._cache, self._order = {}, []
+        g = self.manifest["grid"]
+        self.source_shape = (int(g["nlat"]), int(g["nlon"]))
+        self.shape = (tuple(int(v) for v in target_shape)
+                      if target_shape else self.source_shape)
+        self.regridder = Regridder(self.source_shape, self.shape)
+        if not self.regridder.identity:
+            print(f"[playback] regridding frames {self.regridder.describe()}",
+                  flush=True)
 
     def frame(self, k):
         k = int(max(0, min(self.n - 1, k)))
         if k not in self._cache:
             z = np.load(os.path.join(self.dir, "frames", f"frame_{k:06d}.npz"))
-            self._cache[k] = {key: z[key] for key in z.files}
+            fields = {}
+            for key in z.files:
+                value = z[key]
+                if value.ndim >= 2 and value.shape[-2:] == self.source_shape:
+                    value = self.regridder(value)
+                fields[key] = value
+            self._cache[k] = fields
             self._order.append(k)
             if len(self._order) > 32:
                 self._cache.pop(self._order.pop(0), None)

@@ -19,14 +19,18 @@ time:
   spinup_days: 0
 
 data:
-  # Initial state: ideal | auto | real
+  # Initial state: ideal | auto | real | frame
   # auto uses the real-data files when available and falls back to the
   # idealized state otherwise. An empty init_time uses time.start above.
+  # frame restarts from a recorded frame (frame_file below) of any
+  # resolution or layer count; it is regridded onto the grid above.
   init_mode: ideal
   atmosphere_file: data/era5_pressure_levels.nc
   surface_file: data/era5_single_levels.nc
   ocean_file: data/cmems_surface_currents.nc
   init_time: ""
+  # A frame_XXXXXX.npz, or a run directory (its last frame is used).
+  frame_file: ""
 
 physics:
   # Feature switches
@@ -332,6 +336,8 @@ precompute:
   out_dir: output/run1
   days: 1
   save_every_steps: 60
+  # Also store layer temperature/humidity so frames can restart a model.
+  save_full_state: false
 
 server:
   host: 0.0.0.0
@@ -343,3 +349,7 @@ server:
   record_enabled: false
   record_dir: output/recordings
   record_every_steps: 600
+  record_full_state: false
+  # config: play recordings on grid.nlat x grid.nlon, aggregating finer or
+  # interpolating coarser frames; native: use the recording's own grid.
+  playback_grid: config

@@ -68,6 +68,7 @@ class LiveRecorder:
         self.root = root if os.path.isabs(root) else os.path.join(ROOT, root)
         self.every_steps = max(1, int(getattr(server, "record_every_steps", 15)))
         self.enabled = bool(getattr(server, "record_enabled", True))
+        self.full_state = bool(getattr(server, "record_full_state", False))
         self.run_dir = None
         self.frame_count = 0
 
@@ -120,7 +121,8 @@ class LiveRecorder:
         if not force and model.step_count % self.every_steps:
             return False
         stage_started = time.perf_counter()
-        fields = model.fields_cpu(include_layers=True)
+        fields = (model.fields_cpu(include_layers=True, full_state=True)
+                  if self.full_state else model.fields_cpu(include_layers=True))
         fields = {name: np.asarray(value, dtype=np.float32)
                   for name, value in fields.items()}
         fields["subsolar"] = np.asarray(model.subsolar, dtype=np.float32)
@@ -169,14 +171,18 @@ class Hub:
         self.ocean_layer_index = 0
         if playback_dir:
             self.recorder = None
-            self.player = FramePlayer(playback_dir)
+            playback_grid = str(getattr(cfg.server, "playback_grid", "config")).lower()
+            if playback_grid not in {"config", "native"}:
+                raise ValueError("server.playback_grid must be config or native")
+            target = ((int(cfg.grid.nlat), int(cfg.grid.nlon))
+                      if playback_grid == "config" else None)
+            self.player = FramePlayer(playback_dir, target_shape=target)
             self.idx = 0
             self.model = None
-            g = self.player.manifest["grid"]
-            self.lats, self.lons = _topo.sim_grid(g["nlat"], g["nlon"])
+            nlat, nlon = self.player.shape
+            self.lats, self.lons = _topo.sim_grid(nlat, nlon)
             topo_spec = cfg.grid.get("topo_files", cfg.grid.get("topo_file", ""))
-            elev, land = _topo.load_topo(topo_spec,
-                                         g["nlat"], g["nlon"])
+            elev, land = _topo.load_topo(topo_spec, nlat, nlon)
             self.land = land
             self.fields, self.time_iso = self.player.frame(0)
         else:

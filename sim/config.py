@@ -17,11 +17,15 @@ DEFAULTS = {
     "data": {
         # auto uses real data when the configured file exists, otherwise the
         # original idealized initialization remains available for demos/tests.
-        "init_mode": "auto",       # ideal | auto | real
+        "init_mode": "auto",       # ideal | auto | real | frame
         "atmosphere_file": "data/era5_pressure_levels.nc",
         "surface_file": "data/era5_single_levels.nc",
         "ocean_file": "data/cmems_surface_currents.nc",
         "init_time": "",           # empty: use time.start
+        # init_mode frame: a recorded frame_XXXXXX.npz, or a run directory
+        # (its last frame is used). Any resolution: the fields are
+        # aggregated or interpolated onto the model grid.
+        "frame_file": "",
     },
     "physics": {
         "moisture": True, "radiation": True, "ocean": True,
@@ -273,11 +277,19 @@ DEFAULTS = {
                  "cos_clamp": 0.2,
                  "polar_filter_lat": 65.0, "polar_filter_passes": 6},
     "precompute": {"out_dir": "output/run1", "days": 3,
-                   "save_every_steps": 15},
+                   "save_every_steps": 15,
+                   # Also store layer temperature/humidity so frames can
+                   # restart a model (larger files).
+                   "save_full_state": False},
     "server": {"host": "0.0.0.0", "port": 8000, "steps_per_frame": 3,
                "max_fps": 10, "vector_stride": 5, "basemap_width": 2160,
                "record_enabled": True, "record_dir": "output/recordings",
-               "record_every_steps": 60},
+               "record_every_steps": 60,
+               "record_full_state": False,
+               # config: play recordings on the configured grid, aggregating
+               # or interpolating frames of another resolution; native: use
+               # the recording's own grid.
+               "playback_grid": "config"},
 }
 
 

@@ -1,5 +1,6 @@
 """EarthModel: 状态管理 + 时间积分。"""
 import datetime as _dt
+import os
 import numpy as _np
 import time as _time
 
@@ -334,9 +335,12 @@ class EarthModel:
         """Replace the ideal state with one real analysis snapshot if enabled."""
         data = getattr(self.cfg, "data", None)
         mode = str(getattr(data, "init_mode", "ideal")).lower()
-        if mode not in {"ideal", "auto", "real"}:
-            raise ValueError("data.init_mode must be ideal, auto, or real")
+        if mode not in {"ideal", "auto", "real", "frame"}:
+            raise ValueError("data.init_mode must be ideal, auto, real, or frame")
         if mode == "ideal":
+            return
+        if mode == "frame":
+            self._apply_frame_initialization(str(getattr(data, "frame_file", "")))
             return
         try:
             real = load_real_initialization(
@@ -421,6 +425,169 @@ class EarthModel:
                 finite(sea_ice, 0.0), float(bounds.cloud_min),
                 float(bounds.cloud_max)), dtype=xp.float32) * self.ocean
         self.initialization_source = "real"
+        self._sync_surface_views()
+        self._diag_surface()
+
+    def _apply_frame_initialization(self, frame_path):
+        """Start from a recorded frame, regridded onto the model grid.
+
+        Frames of any horizontal resolution are accepted: finer recordings
+        are aggregated conservatively, coarser ones interpolated.  Layer
+        fields are remapped in ln(p) when the recording has a different
+        number of levels.  Frames saved with ``full_state`` carry layer
+        temperature and humidity; otherwise the lowest-layer values perturb
+        the idealized column with a height-decaying anomaly.
+        """
+        from .precompute import load_frame_file, load_manifest_for_frame
+        from .regrid import regrid_fields, remap_levels
+
+        if not frame_path:
+            raise ValueError("data.init_mode frame requires data.frame_file")
+        frame = load_frame_file(frame_path)
+        manifest = load_manifest_for_frame(frame_path)
+        xp, p = self.xp, self.cfg.physics
+        bounds, ic = p.bounds, p.initial_conditions
+        shape = (self.nlat, self.nlon)
+        fields = regrid_fields(frame, shape)
+
+        def take(name, default=None):
+            value = fields.get(name)
+            return default if value is None else _np.asarray(value, _np.float32)
+
+        temp = take("temp")
+        if temp is None:
+            raise ValueError(f"frame {frame_path} has no temperature field")
+        source_shape = tuple(int(v) for v in _np.asarray(frame["temp"]).shape[-2:])
+        print(f"[model] frame initialization from {frame_path}: "
+              f"{source_shape[0]}x{source_shape[1]} -> {shape[0]}x{shape[1]}",
+              flush=True)
+
+        # --- surface, sea-level pressure and 2-D water/cloud state ---
+        self.Ts = xp.asarray(_np.clip(
+            take("sst", temp) + 273.15, float(bounds.surface_temp_min_k),
+            float(bounds.surface_temp_max_k)), dtype=xp.float32)
+        self._initial_mslp_hpa = xp.asarray(take(
+            "press", _np.full(shape, float(ic.real_default_mslp_hpa),
+                              _np.float32)), dtype=xp.float32)
+        for name, attr, lo, hi in (
+                ("cloud", "cloud", float(bounds.cloud_min), float(bounds.cloud_max)),
+                ("precip", "precip", 0.0, float(bounds.precip_max_mmh)),
+                ("ground_water", "ground_water", 0.0,
+                 float(p.ground_water_capacity_mm))):
+            value = take(name)
+            if value is not None:
+                setattr(self, attr, xp.asarray(
+                    _np.clip(value, lo, hi), dtype=xp.float32))
+        self.ground_water = (self.ground_water * self.land).astype(xp.float32)
+        max_current = float(bounds.ocean_current_max_ms)
+        for name, attr in (("uo", "uo"), ("vo", "vo"),
+                           ("uo_deep", "uo_deep"), ("vo_deep", "vo_deep")):
+            value = take(name)
+            if value is not None and (hasattr(self, attr) or attr in ("uo", "vo")):
+                setattr(self, attr, (xp.asarray(
+                    _np.clip(value, -max_current, max_current), dtype=xp.float32)
+                    * self.ocean).astype(xp.float32))
+        deep = take("sst_deep")
+        if deep is not None:
+            self._frame_deep_temperature = xp.asarray(deep + 273.15, dtype=xp.float32)
+
+        # --- vertical coordinate of the recording ---
+        src_pressure = take("pressure_layers_pa")
+        nz_src = None
+        for name in ("u_layers", "temp_layers"):
+            if fields.get(name) is not None:
+                nz_src = int(fields[name].shape[0])
+                break
+        if nz_src is not None and src_pressure is None:
+            levels_hpa = manifest.get("atmosphere_levels_hpa")
+            levels_m = manifest.get("atmosphere_levels_m")
+            if levels_hpa and len(levels_hpa) == nz_src:
+                src_pressure = 100.0 * _np.asarray(levels_hpa, _np.float64)
+            elif levels_m and len(levels_m) == nz_src:
+                src_pressure = float(
+                    p.dynamics.reference_surface_pressure_pa) * _np.exp(
+                        -_np.asarray(levels_m, _np.float64)
+                        / float(p.vertical.scale_height))
+        if self._primitive_enabled:
+            tv0 = temp + 273.15
+            ps_estimate = _np.asarray(to_cpu(self._initial_mslp_hpa)) * 100.0 * _np.exp(
+                -_np.asarray(to_cpu(self.surface_geopotential)) / (RD * tv0))
+            dst_pressure = (self.hyai[:, None, None]
+                            + self.hybi[:, None, None] * ps_estimate[None])
+            dst_pressure = 0.5 * (dst_pressure[:-1] + dst_pressure[1:])
+        else:
+            dst_pressure = float(
+                p.dynamics.reference_surface_pressure_pa) * _np.exp(
+                    -self.levels_m.astype(_np.float64)
+                    / float(p.vertical.scale_height))
+
+        def vertical(field):
+            field = _np.asarray(field, _np.float32)
+            if field.shape[0] == self.nz and (src_pressure is None
+                                              or nz_src == self.nz):
+                return field
+            if src_pressure is None:
+                raise ValueError(
+                    "frame has a different number of layers and no layer "
+                    "pressures; record it with the manifest or full state")
+            return remap_levels(field, src_pressure, dst_pressure)
+
+        # --- winds ---
+        umax = float(p.umax)
+        if fields.get("u_layers") is not None and fields.get("v_layers") is not None:
+            u = vertical(fields["u_layers"])
+            v = vertical(fields["v_layers"])
+        else:
+            u = _np.asarray(to_cpu(self.u_layers)).copy()
+            v = _np.asarray(to_cpu(self.v_layers)).copy()
+            u[0], v[0] = take("u", u[0]), take("v", v[0])
+        self.u_layers = xp.asarray(_np.clip(u, -umax, umax), dtype=xp.float32)
+        self.v_layers = xp.asarray(_np.clip(v, -umax, umax), dtype=xp.float32)
+        self.w_layers = xp.zeros_like(self.u_layers)
+
+        # --- temperature and humidity columns ---
+        ideal_T = _np.asarray(to_cpu(self.T_layers), _np.float64)
+        ideal_q = _np.asarray(to_cpu(self.q_layers), _np.float64)
+        heights = self.levels_m.astype(_np.float64)[:, None, None]
+        if fields.get("temp_layers") is not None:
+            T = vertical(fields["temp_layers"])
+        else:
+            anomaly = (temp + 273.15) - ideal_T[0]
+            decay = _np.exp(-(heights - heights[0])
+                            / float(ic.temp_wave_decay_height_m))
+            T = ideal_T + anomaly[None] * decay
+        if fields.get("hum_layers") is not None:
+            q = vertical(fields["hum_layers"])
+        else:
+            hum = take("hum")
+            if hum is None:
+                q = ideal_q
+            else:
+                ratio = (hum / 1000.0) / _np.maximum(ideal_q[0], 1e-7)
+                decay = _np.exp(-(heights - heights[0])
+                                / float(ic.humidity_decay_height_m))
+                q = ideal_q * (1.0 + (ratio[None] - 1.0) * decay)
+        self.T_layers = xp.asarray(_np.clip(
+            T, float(bounds.air_temp_min_k), float(bounds.air_temp_max_k)),
+            dtype=xp.float32)
+        self.q_layers = xp.asarray(_np.clip(
+            q, float(bounds.humidity_min), float(bounds.humidity_max)),
+            dtype=xp.float32)
+
+        # --- simulation clock from the recording, when it is known ---
+        times = manifest.get("times") or []
+        name = os.path.basename(frame_path if not os.path.isdir(frame_path)
+                                else "")
+        index = len(times) - 1 if os.path.isdir(frame_path) else None
+        if name.startswith("frame_") and name.endswith(".npz"):
+            try:
+                index = int(name[len("frame_"):-len(".npz")])
+            except ValueError:
+                index = None
+        if index is not None and 0 <= index < len(times):
+            self.t = _dt.datetime.fromisoformat(times[index])
+        self.frame_source = frame_path
+        self.initialization_source = "frame"
         self._sync_surface_views()
         self._diag_surface()
 
@@ -592,6 +759,12 @@ class EarthModel:
         ).astype(xp.float32)
         self.uo_deep = zero.copy()
         self.vo_deep = zero.copy()
+        frame_deep = getattr(self, "_frame_deep_temperature", None)
+        if frame_deep is not None:
+            self.To_deep = xp.where(
+                self.ocean > 0.5,
+                xp.maximum(frame_deep, float(layers.deep_temp_min_k)),
+                self.Ts).astype(xp.float32)
 
     def _advance_ocean(self, Ts, air_u, air_v):
         """Advance wind-driven surface flow and the optional coupled deep layer."""
@@ -1905,8 +2078,12 @@ class EarthModel:
                 + (self.h - self.cfg.physics.H0)
                 * float(pressure.hpa_per_thickness_m))
 
-    def fields_cpu(self, include_layers=False):
-        """导出全部展示字段到 numpy。"""
+    def fields_cpu(self, include_layers=False, full_state=False):
+        """导出全部展示字段到 numpy。
+
+        ``full_state`` additionally stores layer temperature and humidity so
+        a frame can restart the model (``data.init_mode: frame``).
+        """
         fields = {
             "press": to_cpu(self.pressure_hpa()),
             "temp": to_cpu(self.Ta) - 273.15,
@@ -1933,6 +2110,9 @@ class EarthModel:
                 fields["sst_deep"] = to_cpu(self.To_deep) - 273.15
                 fields["uo_deep"] = to_cpu(self.uo_deep)
                 fields["vo_deep"] = to_cpu(self.vo_deep)
+            if full_state:
+                fields["temp_layers"] = to_cpu(self.T_layers)
+                fields["hum_layers"] = to_cpu(self.q_layers)
         return fields
 
     def atmosphere_column_cpu(self, lat_index=None, lon_index=None):

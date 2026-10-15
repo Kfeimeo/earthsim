@@ -43,6 +43,23 @@ python run.py serve --playback output/run1
 
 回放模式下界面出现时间轴与「上一帧」按钮,可任意拖动/倒退。
 
+录像的分辨率可以与 `config.yaml` 的 `grid` 不同：默认 (`server.playback_grid: config`)
+每帧在读取时重投影到配置网格——目标更粗时按面积加权（含 cos φ）聚合，目标更细时
+做双线性插值（经度周期），两个方向独立判断。`playback_grid: native` 则按录像自身网格回放。
+
+### 从录像帧重启模拟
+
+```yaml
+data:
+  init_mode: frame
+  frame_file: output/recordings/20260501_120000/frames/frame_000010.npz   # 或目录(取最后一帧)
+```
+
+帧同样可以是任意分辨率和层数：水平方向按上面的规则聚合/插值，分层场按 ln p
+重映射到当前混合坐标。默认录像只含各层风和气压，温湿廓线由最低层场扰动理想廓线得到；
+若录制时打开 `server.record_full_state`（或预演算的 `precompute.save_full_state`），
+帧中会额外保存各层温度和比湿，重启即为完整状态。模拟时钟取自录像 manifest 中该帧的时间。
+
 ### 3. 性能基准
 
 ```bash
