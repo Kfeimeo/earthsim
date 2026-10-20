@@ -483,9 +483,13 @@ def load_real_initialization(cfg, lats, lons, levels_m,
         precip, precip_da = _find_and_field(
             atmosphere, ("tp", "total_precipitation", "precipitation"),
             target_time, lats, lons)
+        sea_ice, _ = _find_and_field(
+            atmosphere, ("siconc", "ci", "sea_ice_cover",
+                         "sea_ice_area_fraction", "sea_ice_fraction"),
+            target_time, lats, lons)
         fields.update(temp=temp, q=q, u=u, v=v, mslp_hpa=mslp_hpa,
                       surface=surface, cloud=cloud,
-                      ocean_surface=ocean_surface,
+                      ocean_surface=ocean_surface, sea_ice=sea_ice,
                       precip=_convert(precip, precip_da) if precip is not None else None)
 
         if ocean is not None:
@@ -498,13 +502,13 @@ def load_real_initialization(cfg, lats, lons, levels_m,
             osst, osst_da = _find_and_field(
                 ocean, ("thetao", "sst", "sea_surface_temperature", "tos"),
                 target_time, lats, lons)
-            sea_ice, _ = _find_and_field(
+            ocean_ice, _ = _find_and_field(
                 ocean, ("siconc", "sea_ice_fraction", "ice_concentration"),
                 target_time, lats, lons)
             fields.update(ou=ou, ov=ov,
                           ocean_surface=(_temperature(osst, osst_da)
                                          if osst is not None else ocean_surface),
-                          sea_ice=sea_ice)
+                          sea_ice=ocean_ice if ocean_ice is not None else sea_ice)
     finally:
         atmosphere.close()
         if ocean is not None:

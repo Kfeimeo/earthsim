@@ -9,6 +9,9 @@ from .data_loader import RealDataError, load_real_initialization
 from .physics import (Ops, qsat, insolation, A_EARTH,
                       SIGMA, CP, LV, RD, RHO_A, MCOL,
                       RHO_W, CW, C_LAND)
+
+RHO_ICE = 917.0       # sea-ice density kg/m^3
+LF = 3.34e5           # latent heat of fusion J/kg
 from .primitive import (validate_sigma_interfaces, sigma_to_hybrid,
                         generate_hybrid_coefficients,
                         validate_hybrid_coefficients,
@@ -78,6 +81,8 @@ class EarthModel:
             raise ValueError(
                 "physics.dynamics.core must be primitive_equations or shallow_water")
         self._primitive_enabled = dynamics_core == "primitive_equations"
+        self.sea_ice_prognostic = (bool(cfg.physics.ice_albedo)
+                                   and bool(cfg.physics.sea_ice.prognostic))
         _, d0, l0 = insolation(self.xp, self.ops.lat, self.ops.lon_rad, self.t,
                                cfg.physics.S0, cfg.physics.diurnal_cycle)
         self.subsolar = (float(d0), float(l0))
@@ -399,6 +404,16 @@ class EarthModel:
         self.ground_water = (self.land * min(initial_water, capacity)).astype(f32)
         self.runoff = z.copy()
         self.ice, self.snow = z.copy(), z.copy()
+        self.ice_temp = self.Ts.copy()
+        if self.sea_ice_prognostic:
+            # Ocean whose equilibrium surface temperature lies below the
+            # freezing point starts ice covered, with the skin at that
+            # (sub-freezing) temperature and the water at the freezing point.
+            cold = ((self.ocean > 0.5)
+                    & (Teq < float(bounds.ocean_freezing_min_temp_k)))
+            self.ice = xp.where(cold, 1.0, 0.0).astype(f32)
+            self.ice_temp = xp.where(
+                cold, xp.minimum(Teq, self.Ts), self.Ts).astype(f32)
         self.initialization_source = "idealized"
         self._initial_mslp_hpa = xp.full_like(
             z, float(ic.real_default_mslp_hpa))
@@ -473,6 +488,7 @@ class EarthModel:
             dtype=xp.float32)
 
         surface = finite(real.get("surface"), temp[0])
+        skin = surface.copy()   # analysed skin temperature (ice surface over sea ice)
         ocean_surface = real.get("ocean_surface")
         if ocean_surface is not None:
             ocean_surface = finite(ocean_surface, surface)
@@ -481,6 +497,7 @@ class EarthModel:
         self.Ts = xp.asarray(
             _np.clip(surface, float(bounds.surface_temp_min_k),
                      float(bounds.surface_temp_max_k)), dtype=xp.float32)
+        self.ice_temp = self.Ts.copy()
 
         self.uo = xp.asarray(_np.clip(
             finite(real.get("ou"), 0.0), -float(bounds.ocean_current_max_ms),
@@ -495,10 +512,30 @@ class EarthModel:
             finite(real.get("precip"), 0.0), 0,
             float(bounds.precip_max_mmh)), dtype=xp.float32)
         sea_ice = real.get("sea_ice")
+        si = p.sea_ice
         if sea_ice is not None:
-            self.ice = xp.asarray(_np.clip(
-                finite(sea_ice, 0.0), float(bounds.cloud_min),
-                float(bounds.cloud_max)), dtype=xp.float32) * self.ocean
+            ice = _np.clip(finite(sea_ice, 0.0), 0.0, 1.0)
+        elif self.sea_ice_prognostic and bool(si.infer_from_skin_temp):
+            # No concentration field: an analysed skin temperature below the
+            # freezing point over the ocean can only be an ice surface.
+            ice = _np.clip(
+                (float(bounds.ocean_freezing_min_temp_k) - skin)
+                / float(bounds.sea_ice_transition_k), 0.0, 1.0)
+        else:
+            ice = None
+        if ice is not None:
+            self.ice = (xp.asarray(ice, dtype=xp.float32)
+                        * self.ocean).astype(xp.float32)
+        if self.sea_ice_prognostic:
+            # The ice skin starts at the analysed skin temperature; the
+            # water under it keeps the analysed SST (near freezing).
+            ocean_mask = _np.asarray(to_cpu(self.ocean)) > 0.5
+            ice_cpu = _np.asarray(to_cpu(self.ice))
+            skin_k = _np.clip(skin, float(bounds.surface_temp_min_k),
+                              float(si.melt_temp_k))
+            self.ice_temp = xp.asarray(_np.where(
+                ocean_mask & (ice_cpu > 0.0), skin_k,
+                _np.asarray(to_cpu(self.Ts))), dtype=xp.float32)
         self.initialization_source = "real"
         self._sync_surface_views()
         self._diag_surface()
@@ -1079,11 +1116,15 @@ class EarthModel:
         xp, p = self.xp, self.cfg.physics
         if p.ice_albedo:
             bounds = p.bounds
-            self.ice = (self.ocean * xp.clip(
-                (float(bounds.sea_ice_threshold_k) - self.Ts)
-                / float(bounds.sea_ice_transition_k),
-                float(bounds.cloud_min), float(bounds.cloud_max))
-                        ).astype(xp.float32)
+            if self.sea_ice_prognostic:
+                self.ice = (self.ocean
+                            * xp.clip(self.ice, 0.0, 1.0)).astype(xp.float32)
+            else:
+                self.ice = (self.ocean * xp.clip(
+                    (float(bounds.sea_ice_threshold_k) - self.Ts)
+                    / float(bounds.sea_ice_transition_k),
+                    float(bounds.cloud_min), float(bounds.cloud_max))
+                            ).astype(xp.float32)
             self.snow = (self.land *
                          xp.clip((float(bounds.snow_threshold_k) - self.Ts)
                                  / float(bounds.snow_transition_k),
@@ -1292,21 +1333,30 @@ class EarthModel:
         self.subsolar = (float(decl), float(sub_lon))
         greenhouse_q = xp.clip(
             low_q / float(sf.humidity_greenhouse_scale), 0, 1)
+        # Two surface tiles per ocean cell: open water (temperature Ts, the
+        # mixed layer) and sea ice (skin temperature Ti, small heat
+        # capacity). The atmosphere sees the area-weighted fluxes. Without
+        # prognostic ice Ti == Ts and the tiles collapse to the old scheme.
+        fi = self.ice
+        prognostic_ice = self.sea_ice_prognostic
+        Ti = self.ice_temp if prognostic_ice else Ts
         if p.radiation:
-            albedo_surface = (
-                self.ocean * (p.alb_ocean * (1 - self.ice)
-                              + p.alb_ice * self.ice)
+            cloud_albedo = p.alb_cloud * self.cloud
+            albedo_water = (
+                self.ocean * p.alb_ocean
                 + self.land * (p.alb_land * (1 - self.snow)
                                + p.alb_snow * self.snow))
-            albedo = xp.clip(
-                albedo_surface + p.alb_cloud * self.cloud,
-                0, float(rt.albedo_max))
-            SW_surface = (
-                Q_sw * (1 - albedo) * float(rt.surface_sw_fraction))
+            albedo_w = xp.clip(albedo_water + cloud_albedo,
+                               0, float(rt.albedo_max))
+            albedo_i = xp.clip(p.alb_ice + cloud_albedo,
+                               0, float(rt.albedo_max))
+            SW_w = Q_sw * (1 - albedo_w) * float(rt.surface_sw_fraction)
+            SW_i = Q_sw * (1 - albedo_i) * float(rt.surface_sw_fraction)
             SW_air = (
                 Q_sw * (1 - float(rt.cloud_sw_absorption) * self.cloud)
                 * float(rt.air_sw_fraction))
-            LW_up = float(rt.surface_emissivity) * SIGMA * Ts ** 4
+            LW_up_w = float(rt.surface_emissivity) * SIGMA * Ts ** 4
+            LW_up_i = float(rt.surface_emissivity) * SIGMA * Ti ** 4
             emissivity_down = xp.clip(
                 float(rt.down_emissivity_base)
                 + float(rt.down_emissivity_humidity) * greenhouse_q
@@ -1320,27 +1370,76 @@ class EarthModel:
                 float(rt.olr_factor_min), float(rt.olr_factor_max))
             OLR = olr_factor * SIGMA * low_T ** 4
         else:
-            SW_surface = SW_air = LW_up = LW_down = OLR = xp.zeros_like(low_T)
+            SW_w = SW_i = SW_air = LW_up_w = LW_up_i = LW_down = OLR = (
+                xp.zeros_like(low_T))
 
         density0 = low_p / xp.maximum(
             RD * low_T * (1.0 + 0.608 * low_q), 1.0)
-        sensible = (float(sf.sensible_heat_coeff) * density0 * CP * wind
-                    * (Ts - low_T))
+        exchange = float(sf.sensible_heat_coeff) * density0 * CP * wind
+        sensible_w = exchange * (Ts - low_T)
+        sensible_i = exchange * (Ti - low_T)
         if p.moisture:
-            evaporation, land_evaporation = self._surface_evaporation(
+            evaporation_w, land_evaporation = self._surface_evaporation(
                 Ts, low_q, wind, low_p, low_T)
-            latent = LV * evaporation
+            if prognostic_ice:
+                # Sublimation from the ice skin.
+                evaporation_i = (float(p.c_evap) * density0 * wind
+                                 * xp.maximum(qsat(xp, Ti, low_p) - low_q, 0)
+                                 * self.ocean)
+            else:
+                evaporation_i = evaporation_w
         else:
-            evaporation = land_evaporation = latent = xp.zeros_like(low_T)
+            evaporation_w = evaporation_i = land_evaporation = (
+                xp.zeros_like(low_T))
+        latent_w = LV * evaporation_w
+        latent_i = LV * evaporation_i
+        net_w = SW_w + LW_down - LW_up_w - sensible_w - latent_w
+        net_i = SW_i + LW_down - LW_up_i - sensible_i - latent_i
+        SW_surface = (1 - fi) * SW_w + fi * SW_i
+        LW_up = (1 - fi) * LW_up_w + fi * LW_up_i
+        sensible = (1 - fi) * sensible_w + fi * sensible_i
+        evaporation = (1 - fi) * evaporation_w + fi * evaporation_i
+        latent = LV * evaporation
 
         surface_capacity = (
             self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND)
-        Ts = Ts + dt * (
-            SW_surface + LW_down - LW_up - sensible - latent
-        ) / surface_capacity
-        Ts = xp.where(
-            self.ocean > 0.5,
-            xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)), Ts)
+        freezing = float(bounds.ocean_freezing_min_temp_k)
+        if prognostic_ice:
+            si = p.sea_ice
+            melt_temp = float(si.melt_temp_k)
+            ice_capacity = float(si.skin_heat_capacity_j_m2_k)
+            melt_energy = RHO_ICE * LF * float(si.thickness_m)
+            new_ice_energy = RHO_ICE * LF * float(si.new_ice_thickness_m)
+            # Heat entering through leads warms the whole mixed layer; a
+            # mixed layer above freezing melts the ice from below.
+            basal = (float(si.basal_exchange_w_m2_k)
+                     * xp.maximum(Ts - freezing, 0.0) * fi)
+            Ts = Ts + dt * ((1 - fi) * net_w - basal) / surface_capacity
+            Ti = Ti + dt * net_i / ice_capacity
+            # Top melt: energy that would warm the skin above the melting
+            # point is spent on melting ice.
+            excess = xp.maximum(Ti - melt_temp, 0.0) * ice_capacity
+            Ti = xp.minimum(Ti, melt_temp)
+            d_ice = -(excess + dt * basal) / melt_energy
+            # Freezing: open water cannot cool below the freezing point; the
+            # missing energy is taken from the latent heat of new ice.
+            deficit = (xp.maximum(freezing - Ts, 0.0) * surface_capacity
+                       * self.ocean)
+            Ts = xp.where(self.ocean > 0.5, xp.maximum(Ts, freezing), Ts)
+            d_ice = d_ice + deficit / new_ice_energy
+            ice_new = xp.clip(fi + d_ice, 0.0, 1.0) * self.ocean
+            # New ice forms at the freezing point; ice-free cells carry the
+            # water temperature so the skin is ready when ice next forms.
+            Ti = xp.clip(Ti, float(bounds.surface_temp_min_k), melt_temp)
+            Ti = xp.where(ice_new > 0.0, xp.where(fi > 0.0, Ti, freezing), Ts)
+            self.ice = ice_new.astype(xp.float32)
+            self.ice_temp = Ti.astype(xp.float32)
+        else:
+            Ts = Ts + dt * (
+                SW_surface + LW_down - LW_up - sensible - latent
+            ) / surface_capacity
+            Ts = xp.where(
+                self.ocean > 0.5, xp.maximum(Ts, freezing), Ts)
 
         # ---------------- adiabatic dynamics --------------------------------
         # Potential temperature is the transported thermodynamic variable:
@@ -2062,6 +2161,8 @@ class EarthModel:
                     self.pressure_layers_pa)
                 fields["surface_pressure_pa"] = to_cpu(
                     self.surface_pressure)
+            fields["sea_ice"] = to_cpu(self.ice)
+            fields["ice_temp"] = to_cpu(self.ice_temp) - 273.15
             if self.ocean_layers_enabled:
                 fields["sst_deep"] = to_cpu(self.To_deep) - 273.15
                 fields["uo_deep"] = to_cpu(self.uo_deep)
@@ -2110,6 +2211,11 @@ class EarthModel:
         self.T_layers, self.q_layers = state["T_layers"], state["q_layers"]
         self.surface_pressure = state["surface_pressure_pa"]
         self.Ts = state["sst"] + f32(273.15)
+        if "sea_ice" in fields and "ice_temp" in fields:
+            self.ice = load("sea_ice", shape2) * self.ocean
+            self.ice_temp = load("ice_temp", shape2) + f32(273.15)
+        else:
+            self.ice_temp = self.Ts.copy()
         self.uo, self.vo = state["uo"], state["vo"]
         self.cloud, self.precip = state["cloud"], state["precip"]
         self.ground_water = state["ground_water"]

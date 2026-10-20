@@ -224,6 +224,17 @@ physics:
     thickness_max_factor: 1.8
     thickness_diffusion_factor: 0.5
 
+  # Prognostic slab sea ice (fraction + skin temperature from the surface
+  # energy budget; melt at the top, freezing of open water, basal melt).
+  sea_ice:
+    prognostic: true
+    skin_heat_capacity_j_m2_k: 2.0e6
+    thickness_m: 1.5
+    new_ice_thickness_m: 0.3
+    melt_temp_k: 273.15
+    basal_exchange_w_m2_k: 20.0
+    infer_from_skin_temp: true
+
   # Ocean mixed layer and transport
   mld: 40.0
   tau_ocean: 8.0e-7

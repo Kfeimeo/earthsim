@@ -187,6 +187,20 @@ DEFAULTS = {
         # Send runoff downslope to the neighbouring cell and on to the sea
         # instead of removing it locally.
         "river_routing": True,
+        # Prognostic slab sea ice: the ice fraction and its skin temperature
+        # are state variables driven by the surface energy budget (melt at
+        # the top, freezing of open water that cools below the freezing
+        # point, basal melt from a warm mixed layer). prognostic: false keeps
+        # the old diagnosis of the fraction from the sea-surface temperature.
+        "sea_ice": {
+            "prognostic": True,
+            "skin_heat_capacity_j_m2_k": 2.0e6,
+            "thickness_m": 1.5,
+            "new_ice_thickness_m": 0.3,
+            "melt_temp_k": 273.15,
+            "basal_exchange_w_m2_k": 20.0,
+            "infer_from_skin_temp": True,
+        },
         "mld": 40.0, "tau_ocean": 8.0e-7, "drag_ocean": 1.5e-6,
         "visc_ocean": 4.0e4,
         "ocean_transport": {

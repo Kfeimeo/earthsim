@@ -74,6 +74,14 @@ python run.py benchmark
 
 NetCDF4/HDF5 文件需要当前解释器中可用的 `netCDF4` 或 `h5netcdf` 后端；仅有 scipy 时不能读取这类文件。读取成功也不代表平衡：插值、地形变化和压力转换可能产生残差。当前未实现 ERA5 数字滤波初始化或地形平衡调整，超过启动阈值的数据会在首次正式积分前被拒绝；不要仅为绕过检查而提高阈值。
 
+## 海冰
+
+海冰是预报变量（`physics.sea_ice.prognostic: true`）：每个海洋格点有海冰覆盖率和冰面温度两个状态，海水温度与冰面温度分开。大气看到的是按冰/水面积加权的反照率、长波、感热和蒸发（冰面为升华）。冰面热容很小，可以远低于冰点；冰面升到 `melt_temp_k` 后多余能量按冰厚 `thickness_m` 的融化潜热消耗覆盖率；开阔水降到 `bounds.ocean_freezing_min_temp_k` 以下时亏缺能量来自新冰（`new_ice_thickness_m`）的结冰潜热，而不是把海温直接重置回冰点；高于冰点的混合层以 `basal_exchange_w_m2_k` 从冰底融冰。
+
+真实资料初始化读取 `siconc`/`ci`（ERA5 single levels 或 CMEMS），冰区冰面温度取 `skt`，冰下海温取 `sst`；没有覆盖率字段时，海洋上低于冰点的 `skt` 视为海冰（`infer_from_skin_temp`）。理想初始化在平衡地表温度低于冰点的海洋上生成整格海冰。`prognostic: false` 恢复旧的按海温阈值（`bounds.sea_ice_threshold_k`）逐步诊断覆盖率的方式；注意该诊断在 ERA5/OISST 冰下海温（≈271.4 K）下给出零海冰，5 月极昼的北冰洋会作为反照率 0.07 的开阔水面吸收短波并迅速升温。
+
+帧文件（`fields_cpu(include_layers=True)`）额外保存 `sea_ice` 与 `ice_temp`，旧帧没有这两个字段时冰面温度从海温恢复。
+
 ## 平衡理想初始化与启动检查
 
 原始方程的理想初值按以下顺序构建：指定轴对称 `T(纬度,p)` 和压力相关比湿；设置平坦地面位势及常数 `ps`；使用包含水汽的虚温静力积分得到 `Phi`；用积分器同一压力梯度离散算子求解各层梯度风，令 `v=0`；最后加入默认 **0.001 K** 的非轴对称温度扰动。风场不再独立指定。`ideal_wind_enabled: false` 同时去掉温度纬向差异，生成静止背景。
