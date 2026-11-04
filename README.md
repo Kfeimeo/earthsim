@@ -251,3 +251,11 @@ latitudes.
   (`moisture_transport.subsidence_drying_coeff`) removed water and latent
   energy without a heat source; it is disabled in `config.yaml` because the
   primitive core resolves subsidence drying through vertical transport.
+
+### 海冰冻结潜热
+
+`physics.sea_ice.enabled: true`（同时启用 `ice_albedo`）使用混合层冻结/融化能量收支，替代逐步按温度诊断海冰。海表降至 `freezing_temp_k: 271.2` 后，继续损失的热量按 `Δm = -ΔQ / latent_heat_j_kg` 转为海冰质量；回暖先消耗潜热融冰，冰融尽后海温才上升。默认潜热为 334000 J/kg。
+
+`full_cover_mass_kg_m2: 100.0` 是把冰质量换算为覆盖率的可调经验尺度：`覆盖率 = min(冰质量 / 100, 1)`，不是冰厚模型。全覆盖后继续记录冻结质量及其潜热，保证之后融冰时不丢失这部分能量。没有冰厚演化、冰内热传导、盐分或海冰输送；陆地积雪仍按温度诊断。
+
+新录制帧保存 `sea_ice_mass`（kg/m² 海洋面积）供续算恢复；旧帧缺少此字段时由已有覆盖率估算，无法恢复全覆盖之后的额外冰量。关闭 `sea_ice.enabled` 可恢复原有温度诊断和海温托底逻辑；开启时旧的海温托底及海冰温度过渡参数不再控制逐步结冰。

@@ -6,15 +6,15 @@
 backend: cuda            # auto | cuda | cpu
 
 grid:
-  nlat: 90              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
-  nlon: 180             # usually nlat*2
+  nlat: 360              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
+  nlon: 720           # usually nlat*2
   topo_file: data/etopo2022_60s.npz
   topo_files:
     - data/etopo2022_60s.npz
     - data/etopo20.npz
 
 time:
-  dt: 120
+  dt: 20
   start: "2026-05-01T00:00:00"
   spinup_days: 0
 
@@ -22,7 +22,7 @@ data:
   # Initial state: ideal | auto | real
   # auto uses the real-data files when available and falls back to the
   # idealized state otherwise. An empty init_time uses time.start above.
-  init_mode: ideal
+  init_mode: real
   atmosphere_file: data/era5_pressure_levels.nc
   surface_file: data/era5_single_levels.nc
   ocean_file: data/cmems_surface_currents.nc
@@ -34,6 +34,11 @@ physics:
   radiation: true
   ocean: true
   ice_albedo: true
+  sea_ice:
+    enabled: true
+    freezing_temp_k: 271.2
+    latent_heat_j_kg: 334000.0
+    full_cover_mass_kg_m2: 100.0  # Coverage scale only; no thickness model
   diurnal_cycle: true
 
   # Active atmospheric dynamics
@@ -347,7 +352,7 @@ precompute:
 server:
   host: 0.0.0.0
   port: 8000
-  steps_per_frame: 2
+  steps_per_frame: 3
   max_fps: 60
   vector_stride: 5
   basemap_width: 2160

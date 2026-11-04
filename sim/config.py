@@ -26,6 +26,12 @@ DEFAULTS = {
     "physics": {
         "moisture": True, "radiation": True, "ocean": True,
         "ice_albedo": True, "diurnal_cycle": True,
+        "sea_ice": {
+            "enabled": True,
+            "freezing_temp_k": 271.2,
+            "latent_heat_j_kg": 334000.0,
+            "full_cover_mass_kg_m2": 100.0,
+        },
         "dynamics": {
             "core": "primitive_equations",  # primitive_equations | shallow_water
             "top_pressure_pa": 10000.0,

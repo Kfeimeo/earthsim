@@ -399,6 +399,7 @@ class EarthModel:
         self.ground_water = (self.land * min(initial_water, capacity)).astype(f32)
         self.runoff = z.copy()
         self.ice, self.snow = z.copy(), z.copy()
+        self.sea_ice_mass = z.copy()
         self.initialization_source = "idealized"
         self._initial_mslp_hpa = xp.full_like(
             z, float(ic.real_default_mslp_hpa))
@@ -499,6 +500,8 @@ class EarthModel:
             self.ice = xp.asarray(_np.clip(
                 finite(sea_ice, 0.0), float(bounds.cloud_min),
                 float(bounds.cloud_max)), dtype=xp.float32) * self.ocean
+        self.sea_ice_mass = (self.ice *
+            float(self.cfg.physics.sea_ice.full_cover_mass_kg_m2))
         self.initialization_source = "real"
         self._sync_surface_views()
         self._diag_surface()
@@ -1074,16 +1077,45 @@ class EarthModel:
         return au, av
 
     # ------------------------------------------------------------
+    def _phase_change_sea_ice(self):
+        """Conserve C*T - Lf*ice_mass while freezing/melting the mixed layer.
+
+        Mass is per square metre of ocean. Coverage saturates, mass does not;
+        no thickness, conduction, salinity or ice transport is modeled.
+        """
+        xp, p = self.xp, self.cfg.physics
+        cfg = p.sea_ice
+        latent = float(cfg.latent_heat_j_kg)
+        cover_mass = float(cfg.full_cover_mass_kg_m2)
+        capacity = RHO_W * CW * float(p.mld)
+        freezing = float(_np.float32(cfg.freezing_temp_k))
+        if not all(_np.isfinite(v) and v > 0 for v in
+                   (latent, cover_mass, capacity, freezing)):
+            raise ValueError("sea_ice parameters and mixed-layer heat capacity must be positive and finite")
+        ocean = self.ocean > 0.5
+        # Use double precision for the heat/mass ledger to limit cancellation.
+        heat = capacity * (self.Ts.astype(xp.float64) - freezing)
+        mass = xp.maximum(self.sea_ice_mass - heat / latent, 0.0)
+        remaining_heat = xp.maximum(heat - self.sea_ice_mass * latent, 0.0)
+        self.sea_ice_mass = xp.where(ocean, mass, 0.0)
+        self.Ts = xp.where(ocean, freezing + remaining_heat / capacity,
+                           self.Ts).astype(xp.float32)
+        self.ice = xp.where(ocean, xp.clip(mass / cover_mass, 0, 1),
+                            0.0).astype(xp.float32)
+
     def _diag_surface(self):
-        """冰/雪诊断(由温度决定)。"""
+        """Advance sea-ice phase equilibrium; diagnose land snow from temperature."""
         xp, p = self.xp, self.cfg.physics
         if p.ice_albedo:
             bounds = p.bounds
-            self.ice = (self.ocean * xp.clip(
-                (float(bounds.sea_ice_threshold_k) - self.Ts)
-                / float(bounds.sea_ice_transition_k),
-                float(bounds.cloud_min), float(bounds.cloud_max))
-                        ).astype(xp.float32)
+            if p.sea_ice.enabled:
+                self._phase_change_sea_ice()
+            else:
+                self.ice = (self.ocean * xp.clip(
+                    (float(bounds.sea_ice_threshold_k) - self.Ts)
+                    / float(bounds.sea_ice_transition_k),
+                    float(bounds.cloud_min), float(bounds.cloud_max))
+                            ).astype(xp.float32)
             self.snow = (self.land *
                          xp.clip((float(bounds.snow_threshold_k) - self.Ts)
                                  / float(bounds.snow_transition_k),
@@ -1338,9 +1370,10 @@ class EarthModel:
         Ts = Ts + dt * (
             SW_surface + LW_down - LW_up - sensible - latent
         ) / surface_capacity
-        Ts = xp.where(
-            self.ocean > 0.5,
-            xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)), Ts)
+        if not (p.sea_ice.enabled and p.ice_albedo):
+            Ts = xp.where(self.ocean > 0.5,
+                          xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
+                          Ts)
 
         # ---------------- adiabatic dynamics --------------------------------
         # Potential temperature is the transported thermodynamic variable:
@@ -1650,10 +1683,11 @@ class EarthModel:
         # 下垫面热容: 海洋混合层 vs 陆面薄层
         C_sfc = self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND
         Ts = Ts + dt * (SW_sfc + LW_dn - LW_up - SH - LE) / C_sfc
-        # 海冰下海水温度下限
-        Ts = xp.where(self.ocean > 0.5,
-                      xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
-                      Ts)
+        # Legacy floor; latent-heat mode retains cooling for phase change.
+        if not (p.sea_ice.enabled and p.ice_albedo):
+            Ts = xp.where(self.ocean > 0.5,
+                          xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
+                          Ts)
 
         # ============ 大气热力 + 水汽 ============
         Ta = o.adv_diff_step(Ta, u, v, p.diff_T, dt)
@@ -1797,9 +1831,10 @@ class EarthModel:
             E = land_E = LE = xp.zeros_like(Ta0)
         C_sfc = self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND
         Ts = Ts + dt * (SW_sfc + LW_dn - LW_up - SH - LE) / C_sfc
-        Ts = xp.where(self.ocean > 0.5,
-                      xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
-                      Ts)
+        if not (p.sea_ice.enabled and p.ice_albedo):
+            Ts = xp.where(self.ocean > 0.5,
+                          xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
+                          Ts)
 
         # Horizontal thermodynamics are integrated independently on each level.
         seasonal = (float(rt.seasonal_temp_base_k)
@@ -1935,12 +1970,15 @@ class EarthModel:
             self.Ts = xp.clip(
                 self.Ts + dT, float(bounds.surface_temp_min_k),
                 float(bounds.surface_temp_max_k)).astype(xp.float32)
-            # 变暖立即消融冰雪 / 骤冷时下一步会重新诊断
+            if self.cfg.physics.sea_ice.enabled and self.cfg.physics.ice_albedo:
+                self._diag_surface()
+            # Legacy temperature-based melting when latent heat is disabled.
             if float(delta) > 0:
                 melt = xp.clip((self.Ts - float(bounds.sea_ice_threshold_k))
                                / float(bounds.sea_ice_transition_k),
                                float(bounds.cloud_min), float(bounds.cloud_max))
-                self.ice = xp.minimum(self.ice, 1 - melt * self.ocean)
+                if not self.cfg.physics.sea_ice.enabled:
+                    self.ice = xp.minimum(self.ice, 1 - melt * self.ocean)
                 melt_l = xp.clip((self.Ts - float(bounds.snow_threshold_k))
                                  / float(bounds.snow_transition_k),
                                  float(bounds.cloud_min),
@@ -2048,6 +2086,7 @@ class EarthModel:
             "runoff": to_cpu(self.runoff),
             "river_flow": to_cpu(self.river_flow),
             "ice": to_cpu(self.xp.maximum(self.ice, self.snow)),
+            "sea_ice_mass": to_cpu(self.sea_ice_mass),
             "u": to_cpu(self.u), "v": to_cpu(self.v),
             "w": to_cpu(self.w),
             "uo": to_cpu(self.uo), "vo": to_cpu(self.vo),
@@ -2106,6 +2145,16 @@ class EarthModel:
             self.To_deep = state["sst_deep"] + f32(273.15)
             self.uo_deep, self.vo_deep = state["uo_deep"], state["vo_deep"]
 
+        if "sea_ice_mass" in fields:
+            ice_mass = load("sea_ice_mass", shape2)
+            if bool(xp.any(ice_mass < 0)):
+                raise ValueError("frame sea_ice_mass must be non-negative")
+        elif "ice" in fields:
+            ice_mass = (xp.clip(load("ice", shape2), 0, 1) * self.ocean
+                        * float(self.cfg.physics.sea_ice.full_cover_mass_kg_m2))
+        else:
+            ice_mass = xp.zeros(shape2, f32)
+        self.sea_ice_mass = ice_mass
         self.u_layers, self.v_layers = state["u_layers"], state["v_layers"]
         self.T_layers, self.q_layers = state["T_layers"], state["q_layers"]
         self.surface_pressure = state["surface_pressure_pa"]
