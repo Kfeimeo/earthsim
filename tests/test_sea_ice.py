@@ -88,3 +88,54 @@ class SeaIceTests(unittest.TestCase):
         m.Ts[ocean] = 271.2
         m._diag_surface()
         np.testing.assert_allclose(m.ice[ocean], .1, atol=2e-5)
+
+    def test_conductive_growth_matches_two_resistances_and_energy_budget(self):
+        m = self.model()
+        m.cfg["physics"]["radiation"] = False
+        cfg = m.cfg.physics.sea_ice
+        tf = np.float32(cfg.freezing_temp_k)
+        capacity = RHO_W * CW * m.cfg.physics.mld
+        ocean = m.ocean > .5
+        air = np.full_like(m.Ts, tf - 10)
+        transfer = 12.0
+        for h in (.25, 2.0):
+            m.Ts[:] = tf
+            m.sea_ice_mass[ocean] = h * cfg.density_kg_m3
+            m._diag_surface()
+            lw, sh = m._ice_surface_fluxes(m.Ts, air, transfer, 0, 0, 0)
+            # Analytic Fourier + sensible heat solution for a fully covered cell.
+            expected = 10 / (1 / transfer + h / cfg.conductivity_w_m_k)
+            np.testing.assert_allclose(sh[ocean], expected, rtol=3e-5)
+            before = m._ice_thickness().copy()
+            m.Ts = m._apply_surface_heat(m.Ts, -lw - sh, capacity)
+            m._diag_surface()
+            np.testing.assert_allclose(m._ice_thickness()[ocean], before[ocean]
+                + m.dt * expected / (cfg.latent_heat_j_kg * cfg.density_kg_m3),
+                rtol=1e-7)
+            np.testing.assert_array_equal(m.Ts[ocean], tf)
+
+    def test_partial_ice_growth_melt_and_restart_geometry(self):
+        m = self.model()
+        cfg = m.cfg.physics.sea_ice
+        m.cfg["physics"]["radiation"] = False
+        tf = np.float32(cfg.freezing_temp_k)
+        ocean = m.ocean > .5
+        m.Ts[:] = tf
+        m.sea_ice_mass[ocean] = cfg.full_cover_mass_kg_m2 / 2
+        m._diag_surface()
+        thick = cfg.full_cover_mass_kg_m2 / cfg.density_kg_m3
+        np.testing.assert_allclose(m._ice_thickness()[ocean], thick)
+        air = np.full_like(m.Ts, tf - 10)
+        _, sh = m._ice_surface_fluxes(m.Ts, air, 10, 0, 0, 0)
+        np.testing.assert_allclose(sh[ocean], .5 * 100 + .5 * 10 /
+            (.1 + thick / cfg.conductivity_w_m_k), rtol=3e-5)
+        fields = m.fields_cpu(include_layers=True)
+        m.load_frame_state(fields, m.t)
+        np.testing.assert_allclose(m._ice_thickness(), fields["sea_ice_thickness_m"])
+        # Warm air: all available energy melts ice before the water warms.
+        _, sh = m._ice_surface_fluxes(m.Ts, tf + 5, 10, 0, 0, 0)
+        m.Ts = m._apply_surface_heat(m.Ts, -sh, RHO_W * CW * m.cfg.physics.mld)
+        m._diag_surface()
+        np.testing.assert_allclose(m.sea_ice_mass[ocean], cfg.full_cover_mass_kg_m2 / 2
+                                   - 50 * m.dt / cfg.latent_heat_j_kg, rtol=1e-7)
+        np.testing.assert_array_equal(m.Ts[ocean], tf)

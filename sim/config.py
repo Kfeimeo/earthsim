@@ -29,6 +29,8 @@ DEFAULTS = {
         "sea_ice": {
             "enabled": True,
             "freezing_temp_k": 271.2,
+            "density_kg_m3": 917.0,
+            "conductivity_w_m_k": 2.1,
             "latent_heat_j_kg": 334000.0,
             "full_cover_mass_kg_m2": 100.0,
         },

@@ -14,7 +14,7 @@ grid:
     - data/etopo20.npz
 
 time:
-  dt: 20
+  dt: 30
   start: "2026-05-01T00:00:00"
   spinup_days: 0
 
@@ -22,7 +22,7 @@ data:
   # Initial state: ideal | auto | real
   # auto uses the real-data files when available and falls back to the
   # idealized state otherwise. An empty init_time uses time.start above.
-  init_mode: real
+  init_mode: ideal  
   atmosphere_file: data/era5_pressure_levels.nc
   surface_file: data/era5_single_levels.nc
   ocean_file: data/cmems_surface_currents.nc
@@ -37,8 +37,10 @@ physics:
   sea_ice:
     enabled: true
     freezing_temp_k: 271.2
+    density_kg_m3: 917.0
+    conductivity_w_m_k: 2.1
     latent_heat_j_kg: 334000.0
-    full_cover_mass_kg_m2: 100.0  # Coverage scale only; no thickness model
+    full_cover_mass_kg_m2: 100.0  # Reference mass for complete coverage
   diurnal_cycle: true
 
   # Active atmospheric dynamics
@@ -110,12 +112,12 @@ physics:
   ideal_wave_amp_K: 1.2
   ideal_humidity_wave: 0.10
   land_evap: 0.05
-  ground_water_capacity_mm: 150.0
+  ground_water_capacity_mm: 1000
   initial_ground_water_mm: 60.0
   ground_evap_exponent: 1.0
   ground_runoff_tau: 864000.0
   ground_runoff_exponent: 2.0
-  ground_water_diffusivity: 0.0   # m^2/s, 陆地储水侧向扩散, 0 关闭
+  ground_water_diffusivity: 100   # m^2/s, 陆地储水侧向扩散, 0 关闭
   river_routing: true             # 径流沿地形坡度汇流入海
 
   # Idealized wind initialization
@@ -352,7 +354,7 @@ precompute:
 server:
   host: 0.0.0.0
   port: 8000
-  steps_per_frame: 3
+  steps_per_frame: 4
   max_fps: 60
   vector_stride: 5
   basemap_width: 2160

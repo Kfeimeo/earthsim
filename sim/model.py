@@ -900,6 +900,8 @@ class EarthModel:
                      * xp.maximum(qsat(xp, surface_temp, air_pressure)
                                   - air_humidity, 0))
         ocean_evap = potential * self.ocean
+        if p.sea_ice.enabled and p.ice_albedo:
+            ocean_evap = ocean_evap * (1 - self.ice)  # no sublimation model
         land_evap = (potential * float(p.land_evap) * wetness * self.land)
         land_evap = xp.minimum(land_evap, self.ground_water / self.dt)
         return ocean_evap + land_evap, land_evap
@@ -1077,11 +1079,85 @@ class EarthModel:
         return au, av
 
     # ------------------------------------------------------------
+    def _shortwave_albedo(self, surface_albedo):
+        """Use the same absorbed sunlight on the ice tile and in the column."""
+        xp, p = self.xp, self.cfg.physics
+        cloud = p.alb_cloud * self.cloud
+        limit = float(p.radiation_transfer.albedo_max)
+        combined = xp.clip(surface_albedo + cloud, 0, limit)
+        if not (p.ice_albedo and p.sea_ice.enabled):
+            return combined
+        water = xp.clip(p.alb_ocean + cloud, 0, limit)
+        ice = xp.clip(p.alb_ice + cloud, 0, limit)
+        return xp.where(self.ocean > .5, water + self.ice * (ice - water), combined)
+
+    def _ice_thickness(self):
+        """Mean thickness over the ice-covered fraction, metres (zero off ice)."""
+        xp = self.xp
+        if not (self.cfg.physics.ice_albedo and self.cfg.physics.sea_ice.enabled):
+            return xp.zeros_like(self.Ts)
+        density = float(self.cfg.physics.sea_ice.density_kg_m3)
+        if not _np.isfinite(density) or density <= 0:
+            raise ValueError("sea_ice.density_kg_m3 must be positive and finite")
+        area = self.ice
+        return xp.where(area > 0, self.sea_ice_mass /
+                        (density * xp.where(area > 0, area, 1)), 0).astype(xp.float32)
+
+    def _ice_surface_fluxes(self, Ts, air, transfer, sunlight, down_lw, water_lw):
+        """Zero-layer ice: balance surface exchange against k*(Tf-Tskin)/h.
+
+        Fluxes returned to the atmosphere are grid means. At a cold ice
+        surface the opposite net atmospheric flux equals basal conduction;
+        at the melt point the surplus melts ice. Do not add conduction to
+        the column budget again: it is an internal flux.
+        """
+        xp, p = self.xp, self.cfg.physics
+        sensible = transfer * (Ts - air)
+        if not (p.ice_albedo and p.sea_ice.enabled):
+            return water_lw, sensible
+        cfg, rt = p.sea_ice, p.radiation_transfer
+        k = float(cfg.conductivity_w_m_k)
+        if not _np.isfinite(k) or k <= 0:
+            raise ValueError("sea_ice.conductivity_w_m_k must be positive and finite")
+        h = self._ice_thickness()
+        conductance = k / xp.where(h > 0, h, 1)
+        base = float(_np.float32(cfg.freezing_temp_k))
+        emiss = float(rt.surface_emissivity) * SIGMA if p.radiation else 0.0
+        sw_ice = (sunlight * float(rt.surface_sw_fraction)
+                  * (1 - xp.clip(p.alb_ice + p.alb_cloud * self.cloud,
+                                 0, float(rt.albedo_max)))) if p.radiation else 0.0
+        # Monotone surface balance; Newton from the melting point. Cap at
+        # melting so positive residual energy is retained for phase change.
+        skin = xp.full_like(Ts, base)
+        for _ in range(4):
+            residual = (sw_ice + down_lw - emiss * skin**4
+                        - transfer * (skin - air) + conductance * (base - skin))
+            skin = xp.minimum(base, skin + residual /
+                              (conductance + transfer + 4 * emiss * skin**3))
+        area = self.ice
+        return (water_lw + area * (emiss * skin**4 - water_lw),
+                sensible + area * transfer * (skin - Ts))
+
+    def _apply_surface_heat(self, Ts, flux, capacity):
+        """Apply net J/m² before rounding mixed-layer temperature to float32."""
+        xp, p = self.xp, self.cfg.physics
+        if not (p.ice_albedo and p.sea_ice.enabled):
+            return Ts + self.dt * flux / capacity
+        cfg = p.sea_ice
+        base = float(_np.float32(cfg.freezing_temp_k))
+        heat = ((Ts.astype(xp.float64) - base) * capacity
+                + self.dt * flux - self.sea_ice_mass * float(cfg.latent_heat_j_kg))
+        ocean = self.ocean > 0.5
+        self.sea_ice_mass = xp.where(ocean, xp.maximum(-heat, 0)
+                                     / float(cfg.latent_heat_j_kg), 0)
+        return xp.where(ocean, base + xp.maximum(heat, 0) / capacity,
+                        Ts + self.dt * flux / capacity).astype(xp.float32)
+
     def _phase_change_sea_ice(self):
         """Conserve C*T - Lf*ice_mass while freezing/melting the mixed layer.
 
         Mass is per square metre of ocean. Coverage saturates, mass does not;
-        no thickness, conduction, salinity or ice transport is modeled.
+        the mass and covered area determine the conductive ice thickness.
         """
         xp, p = self.xp, self.cfg.physics
         cfg = p.sea_ice
@@ -1330,9 +1406,7 @@ class EarthModel:
                               + p.alb_ice * self.ice)
                 + self.land * (p.alb_land * (1 - self.snow)
                                + p.alb_snow * self.snow))
-            albedo = xp.clip(
-                albedo_surface + p.alb_cloud * self.cloud,
-                0, float(rt.albedo_max))
+            albedo = self._shortwave_albedo(albedo_surface)
             SW_surface = (
                 Q_sw * (1 - albedo) * float(rt.surface_sw_fraction))
             SW_air = (
@@ -1356,8 +1430,9 @@ class EarthModel:
 
         density0 = low_p / xp.maximum(
             RD * low_T * (1.0 + 0.608 * low_q), 1.0)
-        sensible = (float(sf.sensible_heat_coeff) * density0 * CP * wind
-                    * (Ts - low_T))
+        LW_up, sensible = self._ice_surface_fluxes(
+            Ts, low_T, float(sf.sensible_heat_coeff) * density0 * CP * wind,
+            Q_sw, LW_down, LW_up)
         if p.moisture:
             evaporation, land_evaporation = self._surface_evaporation(
                 Ts, low_q, wind, low_p, low_T)
@@ -1367,9 +1442,8 @@ class EarthModel:
 
         surface_capacity = (
             self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND)
-        Ts = Ts + dt * (
-            SW_surface + LW_down - LW_up - sensible - latent
-        ) / surface_capacity
+        Ts = self._apply_surface_heat(
+            Ts, SW_surface + LW_down - LW_up - sensible - latent, surface_capacity)
         if not (p.sea_ice.enabled and p.ice_albedo):
             Ts = xp.where(self.ocean > 0.5,
                           xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
@@ -1652,8 +1726,7 @@ class EarthModel:
         if p.radiation:
             alb_sfc = (self.ocean * (p.alb_ocean * (1 - self.ice) + p.alb_ice * self.ice)
                        + self.land * (p.alb_land * (1 - self.snow) + p.alb_snow * self.snow))
-            alb = xp.clip(alb_sfc + p.alb_cloud * self.cloud, 0,
-                          float(rt.albedo_max))
+            alb = self._shortwave_albedo(alb_sfc)
             SW_sfc = Q_sw * (1 - alb) * float(rt.surface_sw_fraction)
             SW_air = (Q_sw * (1 - float(rt.cloud_sw_absorption) * self.cloud)
                       * float(rt.air_sw_fraction))
@@ -1673,7 +1746,9 @@ class EarthModel:
             SW_sfc = SW_air = LW_up = LW_dn = OLR_air = xp.zeros_like(Ta)
 
         # ============ 地表通量 ============
-        SH = float(sf.sensible_heat_coeff) * RHO_A * CP * spd * (Ts - Ta)
+        LW_up, SH = self._ice_surface_fluxes(
+            Ts, Ta, float(sf.sensible_heat_coeff) * RHO_A * CP * spd,
+            Q_sw, LW_dn, LW_up)
         if p.moisture:
             E, land_E = self._surface_evaporation(Ts, q, spd)
             LE = LV * E
@@ -1682,7 +1757,7 @@ class EarthModel:
 
         # 下垫面热容: 海洋混合层 vs 陆面薄层
         C_sfc = self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND
-        Ts = Ts + dt * (SW_sfc + LW_dn - LW_up - SH - LE) / C_sfc
+        Ts = self._apply_surface_heat(Ts, SW_sfc + LW_dn - LW_up - SH - LE, C_sfc)
         # Legacy floor; latent-heat mode retains cooling for phase change.
         if not (p.sea_ice.enabled and p.ice_albedo):
             Ts = xp.where(self.ocean > 0.5,
@@ -1803,8 +1878,7 @@ class EarthModel:
                        + p.alb_ice * self.ice)
                        + self.land * (p.alb_land * (1 - self.snow)
                        + p.alb_snow * self.snow))
-            alb = xp.clip(alb_sfc + p.alb_cloud * self.cloud, 0,
-                          float(rt.albedo_max))
+            alb = self._shortwave_albedo(alb_sfc)
             SW_sfc = Q_sw * (1 - alb) * float(rt.surface_sw_fraction)
             SW_air = (Q_sw * (1 - float(rt.cloud_sw_absorption) * self.cloud)
                       * float(rt.air_sw_fraction))
@@ -1823,14 +1897,16 @@ class EarthModel:
         else:
             SW_sfc = SW_air = LW_up = LW_dn = OLR_air = xp.zeros_like(Ta0)
 
-        SH = float(sf.sensible_heat_coeff) * RHO_A * CP * spd * (Ts - Ta0)
+        LW_up, SH = self._ice_surface_fluxes(
+            Ts, Ta0, float(sf.sensible_heat_coeff) * RHO_A * CP * spd,
+            Q_sw, LW_dn, LW_up)
         if p.moisture:
             E, land_E = self._surface_evaporation(Ts, q0, spd)
             LE = LV * E
         else:
             E = land_E = LE = xp.zeros_like(Ta0)
         C_sfc = self.ocean * (RHO_W * CW * p.mld) + self.land * C_LAND
-        Ts = Ts + dt * (SW_sfc + LW_dn - LW_up - SH - LE) / C_sfc
+        Ts = self._apply_surface_heat(Ts, SW_sfc + LW_dn - LW_up - SH - LE, C_sfc)
         if not (p.sea_ice.enabled and p.ice_albedo):
             Ts = xp.where(self.ocean > 0.5,
                           xp.maximum(Ts, float(bounds.ocean_freezing_min_temp_k)),
@@ -2087,6 +2163,7 @@ class EarthModel:
             "river_flow": to_cpu(self.river_flow),
             "ice": to_cpu(self.xp.maximum(self.ice, self.snow)),
             "sea_ice_mass": to_cpu(self.sea_ice_mass),
+            "sea_ice_thickness_m": to_cpu(self._ice_thickness()),
             "u": to_cpu(self.u), "v": to_cpu(self.v),
             "w": to_cpu(self.w),
             "uo": to_cpu(self.uo), "vo": to_cpu(self.vo),

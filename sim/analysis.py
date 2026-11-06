@@ -56,6 +56,8 @@ def analyze_point(fields, lats, lons, land, lat, lon):
         if "river_flow" in fields:
             out["river_flow"] = round(g("river_flow"), 1)
     else:
+        if "sea_ice_thickness_m" in fields and g("sea_ice_thickness_m") > 0:
+            out["ice_thickness_m"] = round(g("sea_ice_thickness_m"), 3)
         out["sst"] = round(g("sst"), 1)
         out["current"] = round(float(np.hypot(g("uo"), g("vo"))), 2)
         if "river_flow" in fields and g("river_flow") > 0:

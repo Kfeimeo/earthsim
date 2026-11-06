@@ -470,6 +470,7 @@ function showCard(d) {
   if (d.river_inflow !== undefined) rows.push(["入海径流", d.river_inflow + " m³/s"]);
   if (d.sst !== undefined) rows.push(["海温", d.sst + " °C"], ["洋流", d.current + " m/s"]);
   if (d.ice > 0) rows.push(["冰雪", d.ice + " %"]);
+  if (d.ice_thickness_m !== undefined) rows.push(["海冰厚度", d.ice_thickness_m + " m"]);
   // 所选高度 (非近地面) 的同点要素, 与画面上的图层/风场一致
   const lv = d.level;
   if (lv && lv.index > 0) {
