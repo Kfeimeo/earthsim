@@ -224,9 +224,8 @@ class Hub:
             g = self.player.manifest["grid"]
             self.lats, self.lons = _topo.sim_grid(g["nlat"], g["nlon"])
             topo_spec = cfg.grid.get("topo_files", cfg.grid.get("topo_file", ""))
-            elev, land = _topo.load_topo(topo_spec,
-                                         g["nlat"], g["nlon"])
-            self.land = land
+            self.elevation, self.land = _topo.load_topo(
+                topo_spec, g["nlat"], g["nlon"])
             self.fields, self.time_iso = self.player.frame(0)
         else:
             self.recorder = LiveRecorder(cfg)
@@ -248,6 +247,7 @@ class Hub:
         self.lats, self.lons = self.model.lats, self.model.lons
         stage_started = time.perf_counter()
         self.land = to_cpu(self.model.land)
+        self.elevation = to_cpu(self.model.elev)
         print(f"[startup] land mask copied to CPU: "
               f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         stage_started = time.perf_counter()
@@ -646,7 +646,7 @@ def create_app(cfg, playback_dir=None):
     async def analyze(lat: float, lon: float, layer: int = -1):
         try:
             out = analyze_point(hub.fields, hub.lats, hub.lons,
-                                hub.land, lat, lon)
+                                hub.land, lat, lon, elevation=hub.elevation)
             # 附带当前所选大气层次 (与画面上的图层/风场一致) 的要素
             lf = hub.level_fields
             if layer >= 0 and lf and lf.get("index") == hub._clip_atmosphere_layer(layer):

@@ -465,6 +465,7 @@ function showCard(d) {
   const rows = [["气温", d.temp + " °C"], ["气压", d.pressure + " hPa"],
     ["比湿", d.humidity + " g/kg"], ["云量", d.cloud + " %"],
     ["降水", d.precip + " mm/h"], ["风", d.wind_speed + " m/s / " + d.wind_dir + "°"]];
+  if (d.elevation_m !== undefined) rows.push([d.surface === "海洋" ? "海底海拔" : "海拔", d.elevation_m + " m"]);
   if (d.ground_water !== undefined) rows.push(["地表储水", d.ground_water + " mm"]);
   if (d.river_flow !== undefined) rows.push(["河流流量", d.river_flow + " m³/s"]);
   if (d.river_inflow !== undefined) rows.push(["入海径流", d.river_inflow + " m³/s"]);

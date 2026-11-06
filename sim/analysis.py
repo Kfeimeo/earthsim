@@ -23,7 +23,7 @@ def classify(temp_c, cloud, precip_mmh, wind_ms):
     return w
 
 
-def analyze_point(fields, lats, lons, land, lat, lon):
+def analyze_point(fields, lats, lons, land, lat, lon, elevation=None):
     """fields: model.fields_cpu() 的结果 (numpy)。"""
     lon = lon % 360.0
     i = int(np.clip(np.abs(lats - lat).argmin(), 0, len(lats) - 1))
@@ -50,6 +50,8 @@ def analyze_point(fields, lats, lons, land, lat, lon):
         "wind_dir": round(wdir),
         "ice": round(g("ice") * 100),
     }
+    if elevation is not None:
+        out["elevation_m"] = round(float(elevation[i, j]))
     if is_land:
         if "ground_water" in fields:
             out["ground_water"] = round(g("ground_water"), 1)
