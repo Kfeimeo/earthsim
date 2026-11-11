@@ -16,7 +16,8 @@ import numpy as np
 from sim.analysis import analyze_point
 from sim.backend import to_cpu
 from sim.model import EarthModel
-from sim.precompute import FramePlayer
+from sim.precompute import (FramePlayer, check_frame_matches_model,
+                            load_initial_frame)
 from sim.primitive import standard_atmosphere_height
 from sim import topo as _topo
 
@@ -103,6 +104,108 @@ def ground_water_stats(lats, land, ground_water):
             "mean": round(float((water * w).sum() / wsum), 2)}
 
 
+def _abs_path(path):
+    path = str(path)
+    return os.path.normpath(path if os.path.isabs(path) else os.path.join(ROOT, path))
+
+
+def frame_run_roots(cfg):
+    """Directories whose sub-directories hold saved runs.
+
+    These are the live recording directory and the parent of the precompute
+    output directory (``output/`` for ``output/run1``).
+    """
+    roots = [_abs_path(getattr(cfg.server, "record_dir", "output/recordings"))]
+    out_dir = str(getattr(cfg.precompute, "out_dir", "") or "")
+    if out_dir:
+        roots.append(os.path.dirname(_abs_path(out_dir)))
+    return list(dict.fromkeys(roots))
+
+
+def _run_id(run_dir):
+    run_dir = os.path.normpath(run_dir)
+    try:
+        rel = os.path.relpath(run_dir, ROOT)
+    except ValueError:  # another drive on Windows
+        return run_dir.replace("\\", "/")
+    return run_dir.replace("\\", "/") if rel.startswith("..") else rel.replace("\\", "/")
+
+
+def _read_run_manifest(run_dir):
+    path = os.path.join(run_dir, "manifest.json")
+    if not (os.path.isfile(path) and os.path.isdir(os.path.join(run_dir, "frames"))):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fp:
+            manifest = json.load(fp)
+    except (OSError, ValueError):
+        return None
+    return manifest if isinstance(manifest.get("times"), list) else None
+
+
+def list_frame_runs(roots):
+    """Saved runs (live recordings, precompute output) usable as initial frames.
+
+    Returns dicts with ``id`` (path relative to the project), the number of
+    frames, the first/last simulation time and the grid, newest first.
+    """
+    runs = []
+    seen = set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            run_dir = os.path.normpath(os.path.join(root, name))
+            if run_dir in seen or not os.path.isdir(run_dir):
+                continue
+            seen.add(run_dir)
+            manifest = _read_run_manifest(run_dir)
+            if not manifest or not manifest["times"]:
+                continue
+            times = manifest["times"]
+            grid = manifest.get("grid", {})
+            runs.append({
+                "id": _run_id(run_dir),
+                "nframes": len(times),
+                "start": times[0],
+                "end": times[-1],
+                "grid": [grid.get("nlat"), grid.get("nlon")],
+                "dynamics_core": manifest.get("dynamics_core"),
+                "mtime": os.path.getmtime(os.path.join(run_dir, "manifest.json")),
+            })
+    runs.sort(key=lambda r: r["mtime"], reverse=True)
+    return runs
+
+
+def resolve_frame_run(roots, run_id):
+    """Map a run id from ``list_frame_runs`` back to its directory.
+
+    Only runs found under ``roots`` are accepted, so a client cannot point
+    the server at an arbitrary path.
+    """
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            run_dir = os.path.normpath(os.path.join(root, name))
+            if _run_id(run_dir) == str(run_id) and _read_run_manifest(run_dir):
+                return run_dir
+    raise ValueError(f"找不到记录 {run_id}")
+
+
+def frame_path(run_dir, index):
+    return os.path.join(run_dir, "frames", f"frame_{int(index):06d}.npz")
+
+
+def describe_frame(path):
+    """(run id, frame index) of a frame file path."""
+    path = os.path.normpath(path)
+    name = os.path.basename(path)
+    index = int(name[len("frame_"):-len(".npz")]) if (
+        name.startswith("frame_") and name.endswith(".npz")) else None
+    return _run_id(os.path.dirname(os.path.dirname(path))), index
+
+
 class LiveRecorder:
     """Persist live frames in the same format consumed by ``FramePlayer``."""
 
@@ -114,6 +217,7 @@ class LiveRecorder:
         self.enabled = bool(getattr(server, "record_enabled", True))
         self.run_dir = None
         self.frame_count = 0
+        self.init_frame = None  # source frame of the recorded run, if any
 
     def _new_run_dir(self):
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -134,6 +238,8 @@ class LiveRecorder:
             "atmosphere_levels_m": model.levels_m.tolist(),
             "times": self.times,
         }
+        if self.init_frame:
+            manifest["init_frame"] = self.init_frame
         if getattr(model, "_primitive_enabled", False):
             manifest["dynamics_core"] = "primitive_equations"
             manifest["vertical_coordinate"] = model.vertical_coordinate
@@ -200,8 +306,14 @@ class LiveRecorder:
 class Hub:
     """模拟/回放运行器 + WebSocket 广播。"""
 
-    def __init__(self, cfg, playback_dir=None):
+    def __init__(self, cfg, playback_dir=None, init_frame=None):
         self.cfg = cfg
+        # Serialises model replacement (reset / load_frame) with stepping.
+        self.lock = asyncio.Lock()
+        self.run_roots = frame_run_roots(cfg)
+        init_frame = init_frame or getattr(cfg.server, "init_frame", "") or ""
+        self.init_frame = _abs_path(init_frame) if init_frame else None
+        self.init_frame_info = None
         self.playing = True
         self.speed = 1.0
         self.clients = set()
@@ -231,19 +343,56 @@ class Hub:
             self.recorder = LiveRecorder(cfg)
             self._reset_live_state(start_recording=True)
 
-    def _reset_live_state(self, start_recording=False):
-        reset_started = time.perf_counter()
+    def _build_live_model(self, init_frame):
+        """Create the live model, from ``init_frame`` if given.
+
+        Raises before any hub state changes, so a bad frame leaves the
+        running simulation untouched.
+        """
         stage_started = time.perf_counter()
-        self.model = EarthModel(self.cfg)
+        model = EarthModel(self.cfg)
         print(f"[startup] EarthModel created: "
               f"{time.perf_counter() - stage_started:.3f}s", flush=True)
-        if self.cfg.time.spinup_days:
-            n = int(self.cfg.time.spinup_days * 86400 / self.model.dt)
+        if init_frame:
+            stage_started = time.perf_counter()
+            fields, start_time, manifest = load_initial_frame(init_frame)
+            check_frame_matches_model(model, manifest, fields)
+            model.load_frame_state(fields, start_time)
+            print(f"[server] 初始条件: {init_frame}  "
+                  f"(模拟时刻 {start_time.isoformat()}): "
+                  f"{time.perf_counter() - stage_started:.3f}s", flush=True)
+        elif self.cfg.time.spinup_days:
+            # A saved frame is already spun up, so spin-up only applies here.
+            n = int(self.cfg.time.spinup_days * 86400 / model.dt)
             print(f"[server] spin-up {self.cfg.time.spinup_days} 天 ({n} 步)...")
             stage_started = time.perf_counter()
-            self.model.step(n)
+            model.step(n)
             print(f"[startup] model spin-up ({n} steps): "
                   f"{time.perf_counter() - stage_started:.3f}s", flush=True)
+        return model
+
+    def load_init_frame(self, path):
+        """Restart the live run from a saved frame (None: configured state).
+
+        Later resets return to this frame. Recording starts a new run.
+        """
+        path = _abs_path(path) if path else None
+        self._reset_live_state(start_recording=True, init_frame=path)
+        self.init_frame = path
+
+    def _reset_live_state(self, start_recording=False, init_frame=False):
+        reset_started = time.perf_counter()
+        if init_frame is False:
+            init_frame = self.init_frame
+        self.model = self._build_live_model(init_frame)
+        if init_frame:
+            run, index = describe_frame(init_frame)
+            self.init_frame_info = {"run": run, "frame": index,
+                                    "time": self.model.t.isoformat()}
+        else:
+            self.init_frame_info = None
+        if self.recorder:
+            self.recorder.init_frame = init_frame
         self.lats, self.lons = self.model.lats, self.model.lons
         stage_started = time.perf_counter()
         self.land = to_cpu(self.model.land)
@@ -421,6 +570,7 @@ class Hub:
                 self.model, "initialization_source", "unknown")
             meta["recording"] = self.recorder.enabled
             meta["recorded_frames"] = self.recorder.frame_count
+            meta["init_frame"] = self.init_frame_info
         payload = bytearray()
         for name in SCALARS:
             lo, hi = level_ranges.get(name, self.layer_ranges[name])
@@ -456,7 +606,8 @@ class Hub:
             dt_frame = 1.0 / (float(srv.max_fps) * max(self.speed, 0.01))
             if self.playing and self.clients:
                 try:
-                    await asyncio.to_thread(self._advance)
+                    async with self.lock:
+                        await asyncio.to_thread(self._advance)
                 except FloatingPointError as e:
                     print("[server] 数值异常:", e)
                     self.playing = False
@@ -472,8 +623,43 @@ class Hub:
             except Exception:
                 self.clients.discard(c)
 
+    @staticmethod
+    async def notify(ws, message):
+        """Send a JSON text message (not a frame) to one client."""
+        if ws is None:
+            return
+        try:
+            await ws.send_text(json.dumps(message, ensure_ascii=False))
+        except Exception:
+            pass
+
+    async def _load_frame_cmd(self, msg, ws):
+        """Restart the live run from {run, frame}; run=None clears it."""
+        was_playing = self.playing
+        self.playing = False
+        try:
+            path = None
+            if msg.get("run"):
+                index = int(msg.get("frame", 0))
+                if index < 0:
+                    raise ValueError(f"帧序号必须 >= 0: {index}")
+                run_dir = resolve_frame_run(self.run_roots, msg["run"])
+                path = frame_path(run_dir, index)
+            async with self.lock:
+                await asyncio.to_thread(self.load_init_frame, path)
+        except Exception as e:
+            print(f"[server] 加载初始帧失败: {e}", flush=True)
+            await self.notify(ws, {"type": "load_frame", "ok": False,
+                                   "error": str(e)})
+        else:
+            await self.notify(ws, {"type": "load_frame", "ok": True,
+                                   "init_frame": self.init_frame_info})
+        finally:
+            self.playing = was_playing
+        await self.broadcast()
+
     # -------- 控制 --------
-    async def handle_cmd(self, msg):
+    async def handle_cmd(self, msg, ws=None):
         cmd = msg.get("cmd")
         if cmd == "play":
             self.playing = True
@@ -481,8 +667,9 @@ class Hub:
             self.playing = False
         elif cmd == "step":       # 逐帧
             self.playing = False
-            await asyncio.to_thread(self._advance,
-                                    1 if self.mode == "live" else None)
+            async with self.lock:
+                await asyncio.to_thread(self._advance,
+                                        1 if self.mode == "live" else None)
             await self.broadcast()
         elif cmd == "back" and self.mode == "playback":
             self.playing = False
@@ -495,10 +682,14 @@ class Hub:
         elif cmd == "speed":
             self.speed = float(np.clip(msg.get("value", 1.0), 0.1, 16))
         elif cmd == "reset" and self.mode == "live":
+            # Returns to the loaded initial frame, if any.
             was_playing = self.playing
-            await asyncio.to_thread(self._reset_live_state, True)
+            async with self.lock:
+                await asyncio.to_thread(self._reset_live_state, True)
             self.playing = was_playing
             await self.broadcast()
+        elif cmd == "load_frame" and self.mode == "live":
+            await self._load_frame_cmd(msg, ws)
         elif cmd == "record" and self.mode == "live":
             enabled = bool(msg.get("enabled", not self.recorder.enabled))
             await asyncio.to_thread(self.recorder.set_enabled, enabled, self.model)
@@ -558,7 +749,7 @@ class Hub:
                 await self.broadcast()
 
 
-def create_app(cfg, playback_dir=None):
+def create_app(cfg, playback_dir=None, init_frame=None):
     create_started = time.perf_counter()
     stage_started = time.perf_counter()
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -568,7 +759,7 @@ def create_app(cfg, playback_dir=None):
           f"{time.perf_counter() - stage_started:.3f}s", flush=True)
 
     stage_started = time.perf_counter()
-    hub = Hub(cfg, playback_dir)
+    hub = Hub(cfg, playback_dir, init_frame=init_frame)
     print(f"[startup] simulation hub created ({hub.mode}): "
           f"{time.perf_counter() - stage_started:.3f}s", flush=True)
     app = FastAPI(title="EarthSim")
@@ -631,7 +822,27 @@ def create_app(cfg, playback_dir=None):
                 "ocean_layer_index": hub._clip_ocean_layer(hub.ocean_layer_index),
                 "ocean_layer_available": hub._has_ocean_layers(hub.fields),
                 "recording": bool(hub.recorder and hub.recorder.enabled),
-                "recorded_frames": (hub.recorder.frame_count if hub.recorder else 0)}
+                "recorded_frames": (hub.recorder.frame_count if hub.recorder else 0),
+                "init_frame": hub.init_frame_info}
+
+    @app.get("/api/runs")
+    async def runs():
+        """Saved runs whose frames can start the live simulation."""
+        found = await asyncio.to_thread(list_frame_runs, hub.run_roots)
+        shape = [len(hub.lats), len(hub.lons)]
+        for run in found:
+            run.pop("mtime", None)
+            run["compatible"] = (run["grid"] == shape and
+                                 run["dynamics_core"] == "primitive_equations")
+        return {"runs": found, "current": hub.init_frame_info}
+
+    @app.get("/api/run_times")
+    async def run_times(run: str):
+        try:
+            run_dir = resolve_frame_run(hub.run_roots, run)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        return {"run": run, "times": _read_run_manifest(run_dir)["times"]}
 
     @app.get("/api/diagnostics")
     async def diagnostics():
@@ -680,7 +891,7 @@ def create_app(cfg, playback_dir=None):
         try:
             while True:
                 msg = json.loads(await ws.receive_text())
-                await hub.handle_cmd(msg)
+                await hub.handle_cmd(msg, ws)
         except (WebSocketDisconnect, Exception):
             hub.clients.discard(ws)
 

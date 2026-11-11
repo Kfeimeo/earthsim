@@ -305,7 +305,10 @@ DEFAULTS = {
     "server": {"host": "0.0.0.0", "port": 8000, "steps_per_frame": 3,
                "max_fps": 10, "vector_stride": 5, "basemap_width": 2160,
                "record_enabled": True, "record_dir": "output/recordings",
-               "record_every_steps": 60},
+               "record_every_steps": 60,
+               # 实时模式的初始帧 (如 output/run1/frames/frame_000479.npz);
+               # 留空则按 data.init_mode 初始化
+               "init_frame": ""},
 }
 
 

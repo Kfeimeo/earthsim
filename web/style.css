@@ -193,3 +193,24 @@ body {
 #btn-edit { width: 100%; }
 #btn-edit.active { border-color: #f5b14c; color: #f5b14c; box-shadow: 0 0 10px #f5b14c33; }
 canvas#globe.editing { cursor: crosshair; }
+
+/* 初始帧面板 */
+#frame-panel .frame-current {
+  font-size: 11px; color: var(--teal); line-height: 1.4;
+  word-break: break-all; margin-bottom: 4px;
+}
+#frame-panel .frame-row {
+  display: flex; align-items: center; gap: 6px;
+  margin: 6px 0; font-size: 12px; color: #9db0c4;
+}
+#frame-panel select, #frame-panel input[type=number] {
+  background: #0d1420; color: #dbe6f2;
+  border: 1px solid #23324a; border-radius: 6px; padding: 3px 5px; font-size: 12px;
+}
+#frame-panel select { flex: 1; min-width: 0; }
+#frame-panel input[type=range] { flex: 1; min-width: 0; accent-color: var(--teal); }
+#frame-panel input[type=number] { width: 52px; }
+#frame-panel .frame-time { font-size: 11px; color: var(--amber); margin: 2px 0 6px; }
+#frame-panel .layer-btn:disabled { opacity: 0.45; cursor: default; background: none; }
+#frame-panel .frame-status { font-size: 11px; color: var(--dim); margin-top: 4px; word-break: break-all; }
+#frame-panel .frame-status.error { color: #ff7a6b; }

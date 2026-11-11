@@ -361,7 +361,7 @@ precompute:
   # 从已保存的帧文件继续演算 (如 output/run1/frames/frame_000479.npz);
   # 留空则按 data.init_mode 初始化。也可用命令行 --init-frame 指定。
   # 帧所在目录的 manifest.json 必须与当前网格/垂直层配置一致。
-  init_frame: ""
+  init_frame: "output/recordings/frames/frame_000000.npz"
 
 server:
   host: 0.0.0.0
@@ -373,4 +373,8 @@ server:
   record_enabled: false
   record_dir: output/recordings
   record_every_steps: 600
+  # 实时模式从已保存的帧开始演算 (如 output/run1/frames/frame_000479.npz);
+  # 留空则按 data.init_mode 初始化。也可用 serve --init-frame 指定,
+  # 或在网页"初始帧"面板中选择。要求与 precompute.init_frame 相同。
+  init_frame: ""
 

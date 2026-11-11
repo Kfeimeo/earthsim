@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>EarthSim · 地球天气模拟</title>
-<link rel="stylesheet" href="/static/style.css?v=ui7">
+<link rel="stylesheet" href="/static/style.css?v=ui8">
 </head>
 <body>
 <canvas id="globe"></canvas>
@@ -76,6 +76,16 @@
       </select>
     </div>
   </div>
+  <div id="frame-panel" class="live-only hidden">
+    <div class="panel-title" style="margin-top:14px">初始帧</div>
+    <div class="frame-current" id="frame-current" title="重置 (↺) 回到此初始状态">–</div>
+    <div class="frame-row"><span>记录</span><select id="frame-run"></select></div>
+    <div class="frame-row"><span>帧</span><input type="range" id="frame-index" min="0" max="0" step="1" value="0"><input type="number" id="frame-index-num" class="mono" min="0" value="0"></div>
+    <div class="frame-time mono" id="frame-time">–</div>
+    <button id="btn-load-frame" class="layer-btn">▶ 从此帧演算</button>
+    <button id="btn-clear-frame" class="layer-btn">默认初始场</button>
+    <div class="frame-status" id="frame-status"></div>
+  </div>
 </aside>
 
 <div id="hud-right">
@@ -127,6 +137,6 @@
 
 <div id="hint">拖动旋转 · 滚轮缩放 · 点击地表查看天气</div>
 
-<script type="module" src="/static/app.js?v=ui7"></script>
+<script type="module" src="/static/app.js?v=ui8"></script>
 </body>
 </html>

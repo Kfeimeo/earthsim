@@ -3,6 +3,8 @@
 
   python run.py serve                       # 实时模拟 + 可视化
   python run.py serve --playback output/run1  # 回放预演算结果
+  python run.py serve --init-frame output/run1/frames/frame_000479.npz
+                                            # 实时模拟从已保存的帧开始
   python run.py precompute --days 5         # 离线预演算
   python run.py precompute --init-frame output/run1/frames/frame_000479.npz
                                             # 从已保存的帧继续演算
@@ -20,9 +22,12 @@ def main():
     ap.add_argument("--playback", default=None, help="回放目录 (serve 用)")
     ap.add_argument("--days", type=float, default=None, help="预演算天数")
     ap.add_argument("--init-frame", default=None,
-                    help="预演算的初始帧文件 (覆盖 precompute.init_frame)")
+                    help="初始帧文件: precompute 覆盖 precompute.init_frame, "
+                         "serve 覆盖 server.init_frame")
     ap.add_argument("--port", type=int, default=None)
     args = ap.parse_args()
+    if args.command == "serve" and args.playback and args.init_frame:
+        ap.error("--init-frame 只用于实时模式, 不能与 --playback 同时使用")
     print(f"[startup] arguments parsed: "
           f"{time.perf_counter() - startup_started:.3f}s", flush=True)
 
@@ -67,7 +72,11 @@ def main():
         print(f"[startup] server modules imported: "
               f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         stage_started = time.perf_counter()
-        app = create_app(cfg, playback_dir=args.playback)
+        import os
+        # 命令行路径相对当前目录; 配置中的路径相对项目根目录
+        init_frame = os.path.abspath(args.init_frame) if args.init_frame else None
+        app = create_app(cfg, playback_dir=args.playback,
+                         init_frame=init_frame)
         print(f"[startup] application created: "
               f"{time.perf_counter() - stage_started:.3f}s", flush=True)
         host = cfg.server.host

@@ -757,6 +757,145 @@ function drawGroundWaterChart() {
   c.fillStyle = "rgba(94, 234, 212, 0.10)"; c.fill();
 }
 
+// ---------------- 初始帧 (实时模式从已保存的帧开始演算) ----------------
+const frameUi = {
+  run: document.getElementById("frame-run"),
+  index: document.getElementById("frame-index"),
+  num: document.getElementById("frame-index-num"),
+  time: document.getElementById("frame-time"),
+  current: document.getElementById("frame-current"),
+  status: document.getElementById("frame-status"),
+  load: document.getElementById("btn-load-frame"),
+  clear: document.getElementById("btn-clear-frame"),
+  times: [], initFrame: meta.init_frame || null, busy: false,
+};
+const formatSimTime = iso => (iso ? iso.replace("T", " ").slice(0, 16) : "–");
+const shortRunId = id => id.replace(/^output\//, "");
+
+function setFrameStatus(text, error = false) {
+  frameUi.status.textContent = text;
+  frameUi.status.classList.toggle("error", error);
+}
+function setFrameBusy(busy) {
+  frameUi.busy = busy;
+  updateFrameControls();
+}
+function showInitFrame(info) {
+  frameUi.initFrame = info || null;
+  frameUi.current.textContent = info
+    ? `当前: ${shortRunId(info.run)} #${info.frame} · ${formatSimTime(info.time)}`
+    : "当前: 默认初始场";
+  updateFrameControls();
+}
+function selectedFrameIndex() {
+  const n = frameUi.times.length;
+  const k = parseInt(frameUi.num.value, 10);
+  return n ? Math.min(Math.max(Number.isFinite(k) ? k : 0, 0), n - 1) : 0;
+}
+function setFrameIndex(k) {
+  frameUi.index.value = k;
+  frameUi.num.value = k;
+  updateFrameControls();
+}
+function updateFrameControls() {
+  const n = frameUi.times.length;
+  const k = selectedFrameIndex();
+  frameUi.time.textContent = n ? `${formatSimTime(frameUi.times[k])} UTC · ${k + 1}/${n}` : "–";
+  frameUi.load.disabled = frameUi.busy || !n;
+  frameUi.clear.disabled = frameUi.busy || !frameUi.initFrame;
+  frameUi.run.disabled = frameUi.busy;
+}
+async function loadFrameTimes(preferredIndex = null) {
+  const run = frameUi.run.value;
+  frameUi.times = [];
+  if (run) {
+    try {
+      const d = await (await fetch(`/api/run_times?run=${encodeURIComponent(run)}`)).json();
+      frameUi.times = Array.isArray(d.times) ? d.times : [];
+      if (d.error) setFrameStatus(d.error, true);
+    } catch (e) {
+      setFrameStatus("读取记录失败: " + e, true);
+    }
+  }
+  const n = frameUi.times.length;
+  frameUi.index.max = Math.max(n - 1, 0);
+  frameUi.num.max = Math.max(n - 1, 0);
+  // 默认选最后一帧 (接着上次的结果继续演算)
+  setFrameIndex(preferredIndex !== null && preferredIndex < n ? preferredIndex : Math.max(n - 1, 0));
+}
+async function refreshFrameRuns() {
+  let d;
+  try {
+    d = await (await fetch("/api/runs")).json();
+  } catch (e) {
+    setFrameStatus("读取记录列表失败: " + e, true);
+    return;
+  }
+  const previous = frameUi.run.value;
+  frameUi.run.innerHTML = "";
+  for (const r of d.runs) {
+    const o = document.createElement("option");
+    o.value = r.id;
+    o.textContent = `${shortRunId(r.id)} (${r.nframes})`;
+    o.disabled = !r.compatible;
+    o.title = `${formatSimTime(r.start)} → ${formatSimTime(r.end)} · ${r.grid[0]}x${r.grid[1]}`
+      + (r.compatible ? "" : " · 与当前网格/动力核心不一致");
+    frameUi.run.appendChild(o);
+  }
+  if (!d.runs.length) {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = "无已保存的记录";
+    frameUi.run.appendChild(o);
+  }
+  const usable = id => d.runs.some(r => r.id === id && r.compatible);
+  const current = frameUi.initFrame && frameUi.initFrame.run;
+  const pick = [previous, current].find(usable) || (d.runs.find(r => r.compatible) || {}).id || "";
+  frameUi.run.value = pick;
+  const keep = pick === previous ? selectedFrameIndex()
+    : (pick === current ? frameUi.initFrame.frame : null);
+  await loadFrameTimes(keep);
+}
+if (meta.mode === "live") {
+  document.getElementById("frame-panel").classList.remove("hidden");
+  showInitFrame(meta.init_frame);
+  frameUi.run.onchange = () => loadFrameTimes();
+  // 列表在聚焦时刷新, 以包含运行期间新增的记录帧
+  frameUi.run.addEventListener("focus", () => { if (!frameUi.busy) refreshFrameRuns(); });
+  frameUi.index.oninput = () => setFrameIndex(parseInt(frameUi.index.value, 10));
+  frameUi.num.onchange = () => setFrameIndex(selectedFrameIndex());
+  frameUi.load.onclick = () => {
+    if (!frameUi.run.value || !frameUi.times.length) return;
+    const k = selectedFrameIndex();
+    setFrameBusy(true);
+    setFrameStatus(`正在加载 ${shortRunId(frameUi.run.value)} #${k} …`);
+    requestFrameLoad({ cmd: "load_frame", run: frameUi.run.value, frame: k });
+  };
+  frameUi.clear.onclick = () => {
+    setFrameBusy(true);
+    setFrameStatus("正在恢复默认初始场 …");
+    requestFrameLoad({ cmd: "load_frame", run: null });
+  };
+  refreshFrameRuns();
+}
+function requestFrameLoad(message) {
+  if (ws.readyState !== WebSocket.OPEN) {
+    setFrameBusy(false);
+    setFrameStatus("连接未就绪", true);
+    return;
+  }
+  ws.send(JSON.stringify(message));
+}
+function handleServerMessage(msg) {
+  if (msg.type !== "load_frame") return;
+  setFrameBusy(false);
+  if (msg.ok) {
+    showInitFrame(msg.init_frame);
+    setFrameStatus(msg.init_frame ? "已从该帧开始演算" : "已恢复默认初始场");
+  } else {
+    setFrameStatus("加载失败: " + msg.error, true);
+  }
+}
+
 // ---------------- WebSocket ----------------
 const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
 ws.binaryType = "arraybuffer";
@@ -764,6 +903,7 @@ const send = o => ws.readyState === 1 && ws.send(JSON.stringify(o));
 ws.onopen = syncFlowSettings;
 
 ws.onmessage = ev => {
+  if (typeof ev.data === "string") { handleServerMessage(JSON.parse(ev.data)); return; }
   const dv = new DataView(ev.data);
   const jlen = dv.getUint32(0, true);
   const m = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, jlen)));
@@ -803,6 +943,7 @@ function render(m, windLayerMatchesSelection = true, oceanLayerMatchesSelection 
   document.getElementById("btn-play").textContent = m.playing ? "⏸" : "▶";
   playing = m.playing;
   if (m.mode === "live" && typeof m.recording === "boolean") setRecordingState(m.recording);
+  if (m.mode === "live" && "init_frame" in m && !frameUi.busy) showInitFrame(m.init_frame);
   if (m.mode === "playback") {
     document.querySelectorAll(".pb-only").forEach(x => x.classList.remove("hidden"));
     const tl = document.getElementById("timeline");
@@ -827,6 +968,8 @@ const tl = document.getElementById("timeline");
 tl.addEventListener("pointerdown", () => seeking = true);
 tl.addEventListener("change", () => { send({ cmd: "seek", value: parseInt(tl.value) }); seeking = false; });
 window.addEventListener("keydown", e => {
+  // 在初始帧面板里用方向键选帧时, 不触发播放控制
+  if (e.target.closest && e.target.closest("#frame-panel")) return;
   if (e.key === " ") { e.preventDefault(); send({ cmd: playing ? "pause" : "play" }); }
   if (e.key === "ArrowRight") send({ cmd: "step" });
   if (e.key === "ArrowLeft") send({ cmd: "back" });
