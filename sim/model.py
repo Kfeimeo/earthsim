@@ -44,6 +44,9 @@ class EarthModel:
         print(f"[startup] topography copied to {self.backend}: "
               f"{_time.perf_counter() - stage_started:.3f}s", flush=True)
         n = cfg.numerics
+        self._diagnostic_interval = max(
+            int(n.get("diagnostic_interval_steps", 60)), 1)
+        self._diagnose_step = True
         self.advection_scheme = str(n.advection).lower()
         if self.advection_scheme in {"muscl", "tvd"}:
             self.advection_scheme = "muscl_tvd"
@@ -78,6 +81,7 @@ class EarthModel:
             raise ValueError(
                 "physics.dynamics.core must be primitive_equations or shallow_water")
         self._primitive_enabled = dynamics_core == "primitive_equations"
+        self._quadratic_drag_enabled()  # validate physics.surface_drag_form
         _, d0, l0 = insolation(self.xp, self.ops.lat, self.ops.lon_rad, self.t,
                                cfg.physics.S0, cfg.physics.diurnal_cycle)
         self.subsolar = (float(d0), float(l0))
@@ -310,6 +314,7 @@ class EarthModel:
         drains = land & (target < n)
         target_is_land = land.ravel()[_np.minimum(target, n - 1)]
         self.river_target = xp.asarray(target.ravel())
+        self._river_received = xp.zeros(n + 1, dtype=xp.float64)
         self.river_sink = xp.asarray((land & ~drains).astype(_np.float32))
         self.river_to_ocean = xp.asarray(
             (drains & ~target_is_land).astype(_np.float32))
@@ -599,6 +604,7 @@ class EarthModel:
             name: zero for name in ("wind", "temperature", "humidity",
                                     "surface_pressure")}
         g = float(p.g_eff)
+        self._diagnosed_step = 0
         self._budget = {
             "total_energy_j_m2": self._global_mean(column_total_energy(
                 xp, self.u_layers, self.v_layers, self.T_layers,
@@ -877,6 +883,36 @@ class EarthModel:
         land_drag = float(p.drag_land_atmosphere)
         return self.ocean * ocean_drag + self.land * land_drag
 
+    def _quadratic_drag_enabled(self):
+        """True for the bulk quadratic surface stress, False for linear."""
+        form = str(self.cfg.physics.surface_drag_form).lower()
+        if form not in {"quadratic", "linear"}:
+            raise ValueError(
+                "physics.surface_drag_form must be quadratic or linear")
+        return form == "quadratic"
+
+    def _surface_drag_rate(self, u_surface, v_surface, depth_m):
+        """Surface-stress damping rate (1/s) of an air layer ``depth_m`` deep.
+
+        Quadratic form: tau / rho = C_D |V| V, so a layer of that depth
+        decays at C_D |V| / depth. |V| is floored by drag_wind_min so that
+        calm air stays coupled to the ground through unresolved gusts.
+        Linear form: the configured constant rates, independent of wind.
+        """
+        if not self._quadratic_drag_enabled():
+            return self._surface_atmospheric_drag()
+        xp, p = self.xp, self.cfg.physics
+        cd = (self.ocean * float(p.cd_ocean_atmosphere)
+              + self.land * float(p.cd_land_atmosphere))
+        speed = xp.maximum(xp.sqrt(u_surface * u_surface
+                                   + v_surface * v_surface),
+                           float(p.drag_wind_min))
+        return cd * speed / depth_m
+
+    def _shallow_water_drag_depth(self):
+        """Boundary-layer depth over which shallow-water surface stress acts."""
+        return max(float(self.cfg.physics.topography.influence_height), 1.0)
+
     def _surface_evaporation(self, surface_temp, air_humidity, wind_speed,
                              air_pressure=None, air_temperature=None):
         """Return total and land evaporation in kg m-2 s-1.
@@ -975,13 +1011,23 @@ class EarthModel:
         """
         xp, n = self.xp, self.nlat * self.nlon
         mass = (runoff_mm.astype(xp.float64) * self._cell_area_m2).ravel()
-        received = xp.bincount(self.river_target, weights=mass,
-                               minlength=n + 1)
+        if self.backend == "cuda":
+            # cupy.bincount validates its input on the host and therefore
+            # synchronises the stream every step; a scatter-add does not.
+            import cupyx
+            received = self._river_received
+            received.fill(0.0)
+            cupyx.scatter_add(received, self.river_target, mass)
+        else:
+            received = xp.bincount(self.river_target, weights=mass,
+                                   minlength=n + 1)
         received_cells = received[:n].reshape(self.nlat, self.nlon)
-        per_second = 1.0 / (1000.0 * self.dt)   # kg per step -> m^3/s
-        self._river_budget["river_discharge_to_ocean_m3_s"] = (
-            (received_cells * self.ocean).sum() * per_second)
-        self._river_budget["endorheic_drainage_m3_s"] = received[n] * per_second
+        if self._diagnose_step:
+            per_second = 1.0 / (1000.0 * self.dt)   # kg per step -> m^3/s
+            self._river_budget["river_discharge_to_ocean_m3_s"] = (
+                (received_cells * self.ocean).sum() * per_second)
+            self._river_budget["endorheic_drainage_m3_s"] = (
+                received[n] * per_second)
         return (received_cells / self._cell_area_m2).astype(xp.float32)
 
     def _update_cloud_cover(self, diagnostic_cloud, rh, div):
@@ -1046,10 +1092,16 @@ class EarthModel:
                        float(mt.relative_humidity_min),
                        float(mt.effective_rh_max))
 
-    def _terrain_acceleration(self, u, v, k):
-        """Return roughness drag, mountain blocking and contour deflection."""
+    def _terrain_acceleration(self, u, v, k, surface_wind=None):
+        """Return roughness drag, mountain blocking and contour deflection.
+
+        ``surface_wind`` is the (u, v) pair that sets the quadratic surface
+        stress; it defaults to this layer's own wind.
+        """
         xp, p, tp, o = self.xp, self.cfg.physics, self.cfg.physics.topography, self.ops
-        surface_drag = self._surface_atmospheric_drag()
+        us, vs = (u, v) if surface_wind is None else surface_wind
+        surface_drag = self._surface_drag_rate(
+            us, vs, self._shallow_water_drag_depth())
         if not tp.enabled:
             return -surface_drag * u, -surface_drag * v
         attenuation = _np.exp(-float(self.levels_m[k]) /
@@ -1203,8 +1255,23 @@ class EarthModel:
 
     # ------------------------------------------------------------
     def step(self, nsteps=1):
-        for _ in range(int(nsteps)):
-            self._step_once()
+        """Advance ``nsteps`` time steps.
+
+        The global energy and water budgets behind
+        :meth:`energy_diagnostics` are refreshed every
+        ``numerics.diagnostic_interval_steps`` steps and always on the last
+        step of this call, so they describe the state returned here.
+        Skipping them in between saves a dozen global reductions per step.
+        """
+        nsteps = int(nsteps)
+        interval = self._diagnostic_interval
+        for i in range(nsteps):
+            self._diagnose_step = (self.step_count % interval == 0
+                                   or i == nsteps - 1)
+            try:
+                self._step_once()
+            finally:
+                self._diagnose_step = True
 
     def _step_once(self):
         if self._primitive_enabled:
@@ -1254,8 +1321,17 @@ class EarthModel:
         return (phi_x + coefficient * logp_x,
                 phi_y + coefficient * logp_y)
 
-    def _primitive_boundary_drag_rate(self, geopotential_layers):
-        """Surface-stress damping rate distributed through the lowest layers."""
+    def _primitive_boundary_drag_rate(self, geopotential_layers, u, v,
+                                      pressure_layers, virtual_temperature,
+                                      dp):
+        """Surface-stress damping rate distributed through the lowest layers.
+
+        The rate on layer k is r_k = r_s * w_k * roughness with
+        w_k = exp(-z_k / influence_height). For the quadratic form r_s is
+        normalised so that sum_k r_k * V * dp_k / g = rho_s * C_D * |V| * V
+        for a vertically uniform wind V, i.e. the column loses momentum at
+        the bulk surface-stress rate whatever the profile depth.
+        """
         xp, p, tp = (self.xp, self.cfg.physics,
                      self.cfg.physics.topography)
         z_agl = xp.maximum(
@@ -1267,7 +1343,15 @@ class EarthModel:
             self.terrain_slope / max(float(tp.slope_scale), 1.0e-6), 0, 1)
         roughness = (1.0 + self.land * float(tp.drag_multiplier)
                      * slope_roughness)
-        return (self._surface_atmospheric_drag()[None, :, :]
+        if self._quadratic_drag_enabled():
+            # Effective depth (m) = weighted column mass / surface density.
+            rho_surface = pressure_layers[0] / (RD * virtual_temperature[0])
+            weighted_mass = (vertical_weight * dp).sum(axis=0) / float(p.g_eff)
+            surface_rate = self._surface_drag_rate(
+                u[0], v[0], weighted_mass / rho_surface)
+        else:
+            surface_rate = self._surface_atmospheric_drag()
+        return (surface_rate[None, :, :]
                 * vertical_weight * roughness[None, :, :])
 
     def _global_mean(self, field):
@@ -1519,11 +1603,12 @@ class EarthModel:
             v += dt * damp_y
         u, v = o.coriolis_rotate(u, v, dt)
 
-        # Linear damping terms are integrated implicitly, so no time-step
-        # restriction follows from strong drag or a short sponge timescale.
+        # Damping terms are integrated implicitly (the quadratic drag with
+        # its rate frozen at the pre-drag wind), so no time-step restriction
+        # follows from strong drag or a short sponge timescale.
         kinetic_before = 0.5 * (u * u + v * v)
         damping = 1.0 / (1.0 + dt * self._primitive_boundary_drag_rate(
-            geopotential1))
+            geopotential1, u, v, pressure_state[1], pressure_state[4], dp1))
         u = u * damping
         v = v * damping
         if self.sponge_active:
@@ -1597,7 +1682,9 @@ class EarthModel:
                 seasonal, z_agl)
             relaxation = (equilibrium - T) / float(p.tau_relax_T)
             T += dt * relaxation
-            relaxation_heating = (relaxation * layer_mass * CP).sum(axis=0)
+            if self._diagnose_step:
+                relaxation_heating = (
+                    relaxation * layer_mass * CP).sum(axis=0)
 
         if bool(cpx.vertical_diffusion) and self.nz > 1:
             T, q, u, v = self._vertical_mixing(
@@ -1638,13 +1725,15 @@ class EarthModel:
         # Water crossing the lower boundary changes total atmospheric mass;
         # precipitation leaves it. This term is small but closes the budget.
         ps1 = ps1 + g * (dt * evaporation - rain_mass)
-        energy2 = column_total_energy(
-            xp, u, v, T, q, layer_mass, self.surface_geopotential,
-            (ps1 - p_top) / g, latent_heat)
-        physics_change = self._global_mean(energy2 - energy1)
-        forcing = self._global_mean(
-            surface_heating + column_heating + LV * evaporation
-            + relaxation_heating)
+        diagnose = self._diagnose_step
+        if diagnose:
+            energy2 = column_total_energy(
+                xp, u, v, T, q, layer_mass, self.surface_geopotential,
+                (ps1 - p_top) / g, latent_heat)
+            physics_change = self._global_mean(energy2 - energy1)
+            forcing = self._global_mean(
+                surface_heating + column_heating + LV * evaporation
+                + relaxation_heating)
 
         # ---------------- bounds: a safety net that should stay idle --------
         umax = float(p.umax)
@@ -1652,12 +1741,14 @@ class EarthModel:
         q_min, q_max = float(bounds.humidity_min), float(bounds.humidity_max)
         ps_min = float(dyn.min_surface_pressure_pa)
         ps_max = float(dyn.max_surface_pressure_pa)
-        self._limiter_counts = {
-            "wind": ((xp.abs(u) > umax) | (xp.abs(v) > umax)).sum(),
-            "temperature": ((T < t_min) | (T > t_max)).sum(),
-            "humidity": ((q < q_min) | (q > q_max)).sum(),
-            "surface_pressure": ((ps1 < ps_min) | (ps1 > ps_max)).sum(),
-        }
+        if diagnose:
+            self._limiter_counts = {
+                "wind": ((xp.abs(u) > umax) | (xp.abs(v) > umax)).sum(),
+                "temperature": ((T < t_min) | (T > t_max)).sum(),
+                "humidity": ((q < q_min) | (q > q_max)).sum(),
+                "surface_pressure": (
+                    (ps1 < ps_min) | (ps1 > ps_max)).sum(),
+            }
         self.u_layers = xp.clip(u, -umax, umax).astype(xp.float32)
         self.v_layers = xp.clip(v, -umax, umax).astype(xp.float32)
         self.T_layers = xp.clip(T, t_min, t_max).astype(xp.float32)
@@ -1668,18 +1759,20 @@ class EarthModel:
             float(bounds.surface_temp_min_k),
             float(bounds.surface_temp_max_k)).astype(xp.float32)
 
-        self._budget = {
-            "total_energy_j_m2": self._global_mean(energy2),
-            "kinetic_energy_j_m2": self._global_mean(
-                (layer_mass * 0.5 * (u * u + v * v)).sum(axis=0)),
-            "latent_energy_j_m2": self._global_mean(
-                (layer_mass * latent_heat * q).sum(axis=0)),
-            "dynamics_energy_error_w_m2": dynamics_error / dt,
-            "energy_fixer_dT_k": fixer_dT,
-            "energy_fixer_pending_dT_k": self._energy_fixer_debt_k,
-            "physics_energy_change_w_m2": physics_change / dt,
-            "physics_forcing_w_m2": forcing,
-        }
+        if diagnose:
+            self._diagnosed_step = self.step_count + 1
+            self._budget = {
+                "total_energy_j_m2": self._global_mean(energy2),
+                "kinetic_energy_j_m2": self._global_mean(
+                    (layer_mass * 0.5 * (u * u + v * v)).sum(axis=0)),
+                "latent_energy_j_m2": self._global_mean(
+                    (layer_mass * latent_heat * q).sum(axis=0)),
+                "dynamics_energy_error_w_m2": dynamics_error / dt,
+                "energy_fixer_dT_k": fixer_dT,
+                "energy_fixer_pending_dT_k": self._energy_fixer_debt_k,
+                "physics_energy_change_w_m2": physics_change / dt,
+                "physics_forcing_w_m2": forcing,
+            }
 
         self._refresh_primitive_diagnostics()
         self.omega_layers = omega.astype(xp.float32)
@@ -1812,7 +1905,8 @@ class EarthModel:
         dhdx, dhdy = o.gradient(h)
         u = o.adv_diff_step(u, u, v, p.visc, dt)
         v = o.adv_diff_step(v, u, v, p.visc, dt)
-        surface_drag = self._surface_atmospheric_drag()
+        surface_drag = self._surface_drag_rate(
+            u, v, self._shallow_water_drag_depth())
         u = u + dt * (-p.g_eff * dhdx - surface_drag * u + o.tanl * u * v)
         v = v + dt * (-p.g_eff * dhdy - surface_drag * v - o.tanl * u * u)
         u, v = o.coriolis_rotate(u, v, dt)
@@ -1979,11 +2073,15 @@ class EarthModel:
         h = xp.stack(h_out, axis=0)
         dhdx, dhdy = o.gradient(h)
 
+        # Copy: the in-place updates of layer 0 below would otherwise change
+        # the wind that sets the surface stress for the layers above it.
+        surface_wind = (u_adv[0].copy(), v_adv[0].copy())
         u_out, v_out = [], []
         for k in range(self.nz):
             uk = u_adv[k]
             vk = v_adv[k]
-            terrain_u, terrain_v = self._terrain_acceleration(uk, vk, k)
+            terrain_u, terrain_v = self._terrain_acceleration(
+                uk, vk, k, surface_wind=surface_wind)
             uk += dt * (-p.g_eff * dhdx[k]
                         + terrain_u + o.tanl * uk * vk)
             vk += dt * (-p.g_eff * dhdy[k]
@@ -2286,15 +2384,18 @@ class EarthModel:
         """Global energy, mass, water and stability diagnostics.
 
         Energies are area-weighted column integrals in J m-2; the error and
-        change terms are the last time step's global tendencies in W m-2.
-        ``limiter_counts`` reports how many cells the safety clips touched
-        in the last step; a healthy run keeps every count at zero.
+        change terms are global tendencies in W m-2 of the step
+        ``diagnosed_step``, the last step on which the budgets were
+        evaluated (see :meth:`step`). ``limiter_counts`` reports how many
+        cells the safety clips touched in that step; a healthy run keeps
+        every count at zero.
         """
         if not self._primitive_enabled:
             return {"available": False}
         xp, o, g = self.xp, self.ops, float(self.cfg.physics.g_eff)
         layer_mass = self.layer_pressure_thickness_pa / g
         out = {key: float(value) for key, value in self._budget.items()}
+        out["diagnosed_step"] = int(self._diagnosed_step)
         out["enthalpy_j_m2"] = float(self._global_mean(
             (layer_mass * CP * self.T_layers).sum(axis=0)))
         out["mean_surface_pressure_pa"] = float(

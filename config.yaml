@@ -6,15 +6,15 @@
 backend: cuda            # auto | cuda | cpu
 
 grid:
-  nlat: 360              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
-  nlon: 720           # usually nlat*2
+  nlat: 180              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
+  nlon: 360           # usually nlat*2
   topo_file: data/etopo2022_60s.npz
   topo_files:
     - data/etopo2022_60s.npz
     - data/etopo20.npz
 
 time:
-  dt: 30
+  dt: 100
   start: "2026-05-01T00:00:00"
   spinup_days: 0
 
@@ -22,7 +22,7 @@ data:
   # Initial state: ideal | auto | real
   # auto uses the real-data files when available and falls back to the
   # idealized state otherwise. An empty init_time uses time.start above.
-  init_mode: ideal  
+  init_mode: real  
   atmosphere_file: data/era5_pressure_levels.nc
   surface_file: data/era5_single_levels.nc
   ocean_file: data/cmems_surface_currents.nc
@@ -75,8 +75,18 @@ physics:
   g_eff: 9.8
   beta_T: 22.0
   tau_h: 43200.0
-  drag_ocean_atmosphere: 4.0e-6
-  drag_land_atmosphere: 1.2e-5
+  # Surface drag: quadratic | linear
+  # quadratic: tau = rho * C_D * |V| * V with V the lowest-level wind
+  # (~80 m AGL), spread over the boundary layer with an
+  # exp(-z / topography.influence_height) profile; mountains multiply it by
+  # topography.drag_multiplier. drag_wind_min floors |V| (subgrid gusts).
+  # linear: constant damping rates drag_*_atmosphere (1/s).
+  surface_drag_form: quadratic
+  cd_ocean_atmosphere: 1.0e-3
+  cd_land_atmosphere: 4.0e-3
+  drag_wind_min: 1.0
+  drag_ocean_atmosphere: 4.0e-6   # linear form only
+  drag_land_atmosphere: 1.2e-5    # linear form only
   visc: 2.0e+4
   diff_T: 2.0e+4
   diff_q: 1.0e+4
@@ -331,7 +341,9 @@ physics:
     cyclone_max_wind_ms: 120.0
 
 numerics:
-  diagnostic_interval_steps: 60  # pre-clipping field/CFL/bounds diagnostics
+  # Global energy/water budgets (energy_diagnostics) are evaluated every
+  # this many steps and on the last step of every step() call.
+  diagnostic_interval_steps: 60
   # Second-order finite-volume transport. Limiters: minmod | vanleer | mc.
   advection: muscl_tvd
   advection_limiter: mc
@@ -354,7 +366,7 @@ precompute:
 server:
   host: 0.0.0.0
   port: 8000
-  steps_per_frame: 4
+  steps_per_frame: 1
   max_fps: 60
   vector_stride: 5
   basemap_width: 2160

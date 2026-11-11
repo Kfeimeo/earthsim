@@ -61,9 +61,9 @@ class MultilayerModelTests(unittest.TestCase):
         model.terrain_slope_y[...] = 0
         model.terrain_slope[...] = 0.02
         au, av = model._terrain_acceleration(wind, calm, 0)
-        self.assertLess(
-            float(au.mean()),
-            -float(model.cfg.physics.drag_land_atmosphere) * 10)
+        flat_rate = model._surface_drag_rate(
+            wind, calm, model._shallow_water_drag_depth())
+        self.assertLess(float(au.mean()), -float(flat_rate.mean()) * 10)
         self.assertGreater(float(np.abs(av).mean()), 0)
 
     def test_air_temperature_edit_updates_lowest_layer(self):

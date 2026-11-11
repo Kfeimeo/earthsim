@@ -38,7 +38,8 @@ def adiabatic(cfg, winds=True):
         moisture=False, radiation=False, ocean=False,
         ideal_wind_enabled=winds, ideal_wave_amp_K=0.0,
         ideal_humidity_wave=0.0,
-        drag_ocean_atmosphere=0.0, drag_land_atmosphere=0.0)
+        drag_ocean_atmosphere=0.0, drag_land_atmosphere=0.0,
+        cd_ocean_atmosphere=0.0, cd_land_atmosphere=0.0)
     cfg["physics"]["surface_flux"]["sensible_heat_coeff"] = 0.0
     cfg["physics"]["column_physics"].update(
         vertical_diffusion=False, dry_adjustment=False)

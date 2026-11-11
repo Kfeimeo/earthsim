@@ -207,6 +207,24 @@ def hydrostatic_state(xp, temperature, humidity, surface_pressure,
             xp.stack(phi_interfaces, axis=0), tv)
 
 
+_RAMP_CACHE = {}
+
+
+def _interface_ramp(xp, count):
+    """Cached 0..1 ramp over ``count`` interfaces, shaped [count, 1, 1].
+
+    Rebuilding it from NumPy every step is a host-to-device copy on the GPU
+    and would also prevent capturing a whole step in a CUDA graph.
+    """
+    key = (getattr(xp, "__name__", "numpy"), int(count))
+    ramp = _RAMP_CACHE.get(key)
+    if ramp is None:
+        ramp = xp.asarray(
+            np.linspace(0.0, 1.0, int(count), dtype=np.float32))[:, None, None]
+        _RAMP_CACHE[key] = ramp
+    return ramp
+
+
 def hybrid_mass_flux(xp, ops, u, v, surface_pressure, hyai, hybi):
     """Return ps tendency, layer mass divergence, interface flux and dp.
 
@@ -235,10 +253,7 @@ def hybrid_mass_flux(xp, ops, u, v, surface_pressure, hyai, hybi):
     # Remove accumulated floating-point residue without changing the two
     # boundary values.  This is normally tiny but matters in long integrations.
     if u.shape[0] > 1:
-        ramp = xp.asarray(
-            np.linspace(0.0, 1.0, u.shape[0] + 1, dtype=np.float32)
-        )[:, None, None]
-        flux = flux - ramp * flux[-1:]
+        flux = flux - _interface_ramp(xp, u.shape[0] + 1) * flux[-1:]
     return ps_tendency, div_mass, flux, dp
 
 

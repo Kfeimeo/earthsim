@@ -23,6 +23,8 @@ def primitive_config():
         ideal_humidity_wave=0.0,
         drag_ocean_atmosphere=0.0,
         drag_land_atmosphere=0.0,
+        cd_ocean_atmosphere=0.0,
+        cd_land_atmosphere=0.0,
     )
     return cfg
 
@@ -161,3 +163,63 @@ def test_primitive_step_uses_two_hydrostatic_integrations(monkeypatch):
     calls.clear()
     model.step(1)
     assert len(calls) == 2
+
+
+def _boundary_drag_inputs(model, speed):
+    from sim.primitive import hydrostatic_state
+    state = hydrostatic_state(
+        np, model.T_layers, model.q_layers, model.surface_pressure,
+        model._hyai_xp, model._hybi_xp, model.surface_geopotential)
+    dp = model._d_hyai_xp + model._d_hybi_xp * model.surface_pressure[None]
+    u = np.full_like(model.T_layers, speed)
+    v = np.zeros_like(u)
+    return state, dp, u, v
+
+
+def test_quadratic_surface_drag_matches_bulk_stress():
+    cfg = primitive_config()
+    cfg["physics"].update(cd_ocean_atmosphere=1.0e-3,
+                          cd_land_atmosphere=4.0e-3)
+    cfg["physics"]["topography"]["drag_multiplier"] = 0.0
+    model = EarthModel(cfg)
+    speed = 8.0
+    state, dp, u, v = _boundary_drag_inputs(model, speed)
+    rate = model._primitive_boundary_drag_rate(
+        state[2], u, v, state[1], state[4], dp)
+
+    # Column momentum sink of a uniform wind equals rho_s * C_D * |V| * V.
+    g = float(cfg["physics"]["g_eff"])
+    sink = (rate * u * dp).sum(axis=0) / g
+    rho_s = state[1][0] / (RD * state[4][0])
+    cd = model.ocean * 1.0e-3 + model.land * 4.0e-3
+    np.testing.assert_allclose(sink, rho_s * cd * speed * speed, rtol=1e-4)
+    # Drag decays upward and doubling the wind doubles the rate.
+    assert np.all(np.diff(rate, axis=0) < 0)
+    state2, dp2, u2, v2 = _boundary_drag_inputs(model, 2 * speed)
+    rate2 = model._primitive_boundary_drag_rate(
+        state2[2], u2, v2, state2[1], state2[4], dp2)
+    np.testing.assert_allclose(rate2, 2 * rate, rtol=1e-5)
+
+
+def test_quadratic_drag_floors_calm_wind_and_linear_form_is_constant():
+    cfg = primitive_config()
+    cfg["physics"].update(cd_ocean_atmosphere=1.0e-3,
+                          cd_land_atmosphere=4.0e-3, drag_wind_min=1.0)
+    model = EarthModel(cfg)
+    calm = np.zeros((model.nlat, model.nlon), np.float32)
+    floor_rate = model._surface_drag_rate(calm, calm, 1000.0)
+    cd = model.ocean * 1.0e-3 + model.land * 4.0e-3
+    np.testing.assert_allclose(floor_rate, cd * 1.0 / 1000.0, rtol=1e-6)
+
+    model.cfg["physics"]["surface_drag_form"] = "linear"
+    wind = np.full_like(calm, 20.0)
+    np.testing.assert_allclose(model._surface_drag_rate(wind, calm, 1000.0),
+                               model._surface_atmospheric_drag())
+
+
+def test_unknown_surface_drag_form_is_rejected():
+    import pytest
+    cfg = primitive_config()
+    cfg["physics"]["surface_drag_form"] = "cubic"
+    with pytest.raises(ValueError, match="surface_drag_form"):
+        EarthModel(cfg)

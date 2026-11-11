@@ -56,7 +56,7 @@ python run.py benchmark
 | backend | `auto / cuda / cpu` | 计算后端 |
 | grid | `nlat, nlon` | 分辨率(实时建议 90×180,预演算可 180×360 以上)|
 | time | `dt, spinup_days` | 时间步长(秒)、启动前预热天数 |
-| physics | `dynamics, vertical, column_physics, topography, drag_ocean_atmosphere, drag_land_atmosphere, visc …` | 动力核心/混合 σ–p 分层/上层阻尼、柱物理、地形作用及其他物理超参数 |
+| physics | `dynamics, vertical, column_physics, topography, surface_drag_form, cd_ocean_atmosphere, cd_land_atmosphere, drag_wind_min, drag_ocean_atmosphere, drag_land_atmosphere, visc …` | 动力核心/混合 σ–p 分层/上层阻尼、柱物理、地形作用及其他物理超参数 |
 | precompute | `days, frame_interval_s, out_dir` | 预演算时长与帧间隔 |
 | server | `host, port, max_fps, vector_stride` | 服务与推流参数 |
 

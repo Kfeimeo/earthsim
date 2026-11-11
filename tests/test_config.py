@@ -55,6 +55,7 @@ data:
     assert cfg.physics.visc == 12345.0
     assert cfg.physics.drag_ocean_atmosphere == 7.0e-6
     assert cfg.physics.drag_land_atmosphere == 7.0e-6
+    assert cfg.physics.surface_drag_form == "linear"
 
 
 def test_explicit_physics_values_win_over_legacy_data_layout(tmp_path):

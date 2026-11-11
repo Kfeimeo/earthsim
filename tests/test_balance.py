@@ -112,7 +112,8 @@ def test_unforced_balanced_jet_stays_close_for_100_steps():
     p = cfg["physics"]
     p.update(moisture=False, radiation=False, ocean=False,
              visc=0, diff_T=0, diff_q=0,
-             drag_ocean_atmosphere=0, drag_land_atmosphere=0)
+             drag_ocean_atmosphere=0, drag_land_atmosphere=0,
+             cd_ocean_atmosphere=0, cd_land_atmosphere=0)
     p["surface_flux"]["sensible_heat_coeff"] = 0
     m = EarthModel(cfg)
     initial = m.u_layers.copy()

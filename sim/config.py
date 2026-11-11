@@ -66,6 +66,14 @@ DEFAULTS = {
             },
         },
         "H0": 800.0, "g_eff": 9.8, "beta_T": 22.0, "tau_h": 43200.0,
+        # Surface drag on the atmosphere. quadratic: bulk stress
+        # tau = rho * C_D * |V| * V from the lowest-level wind (~80 m on the
+        # default hybrid grid), distributed through the boundary layer.
+        # linear: constant damping rates drag_*_atmosphere (1/s).
+        "surface_drag_form": "quadratic",
+        "cd_ocean_atmosphere": 1.0e-3,
+        "cd_land_atmosphere": 4.0e-3,
+        "drag_wind_min": 1.0,             # m/s gustiness floor on |V|
         "drag_ocean_atmosphere": 4.0e-6,
         "drag_land_atmosphere": 1.2e-5,
         "visc": 8.0e4, "diff_T": 4.0e4, "diff_q": 2.0e4,
@@ -335,6 +343,7 @@ def _normalize_user_config(user):
         drag = physics.pop("drag")
         physics.setdefault("drag_ocean_atmosphere", drag)
         physics.setdefault("drag_land_atmosphere", drag)
+        physics.setdefault("surface_drag_form", "linear")
     return user
 
 
