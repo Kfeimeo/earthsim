@@ -162,7 +162,9 @@ const globeMat = new THREE.ShaderMaterial({
       float d = dot(n, sunDir);
       float day = smoothstep(-0.16, 0.12, d);
       float illumination = 0.14 + day * 0.96 + max(d, 0.0) * 0.22;
-      col *= mix(1.0, illumination, showNight);
+      // Day/night off: light the whole globe like the subsolar point (d = 1).
+      const float FULL_SUN = 0.14 + 0.96 + 0.22;
+      col *= mix(FULL_SUN, illumination, showNight);
 
       gl_FragColor = vec4(col, 1.0);
     }`,

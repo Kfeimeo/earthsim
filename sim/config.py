@@ -79,7 +79,36 @@ DEFAULTS = {
         "visc": 8.0e4, "diff_T": 4.0e4, "diff_q": 2.0e4,
         "umax": 80.0,
         "S0": 1361.0, "alb_ocean": 0.07, "alb_land": 0.22,
-        "alb_ice": 0.62, "alb_snow": 0.70, "alb_cloud": 0.42,
+        # alb_ocean is the diffuse (overcast) water albedo; under clear sky
+        # the direct-beam value follows the solar zenith angle.
+        "ocean_albedo_zenith": True,
+        # Sea ice: snow-covered cold ice -> bare/ponded ice as the skin
+        # temperature approaches melting (over ice_albedo_transition_k).
+        "alb_ice_cold": 0.75, "alb_ice_melt": 0.50,
+        "ice_albedo_transition_k": 1.0,
+        "alb_snow": 0.70, "alb_ice_sheet": 0.80, "alb_cloud": 0.42,
+        # Direct-beam snow/ice brightening at low sun (0 disables).
+        "snow_zenith_factor": 0.4,
+        # Prognostic land snow pack (snow water equivalent, mm = kg m-2).
+        "snow": {
+            "enabled": True,
+            "full_cover_mm": 10.0,        # SWE for complete cover
+            "rain_snow_temp_k": 274.15,   # 50 % snow at this air temperature
+            "rain_snow_width_k": 2.0,     # all snow below 0 C, rain above 2 C
+            "melt_temp_k": 273.15,
+            "max_mm": 1000.0,             # excess runs off (glacier flow)
+            "initial_mm": 100.0,          # initial SWE where it is cold
+        },
+        # Permanent ice sheets: always snow covered, surface capped at the
+        # melting point (glacier melt beyond the snow pack is not tracked).
+        "ice_sheet": {
+            "enabled": True,
+            "antarctic_lat_max": -60.0,
+            "greenland_lat_min": 59.0,
+            "greenland_lon_min": 286.0,   # 74 W
+            "greenland_lon_max": 349.0,   # 11 W
+            "greenland_min_elevation_m": 500.0,
+        },
         "tau_relax_T": 864000.0,
         "initial_conditions": {
             "balanced_perturbation_k": 0.001,
@@ -118,7 +147,7 @@ DEFAULTS = {
             "relative_humidity_max": 1.3,
         },
         "radiation_transfer": {
-            "albedo_max": 0.85,
+            "albedo_max": 0.90,
             "surface_sw_fraction": 0.80,
             "cloud_sw_absorption": 0.30,
             "air_sw_fraction": 0.18,
@@ -336,7 +365,7 @@ def _normalize_user_config(user):
         # data. Preserve those explicit values instead of silently falling
         # back to DEFAULTS["physics"].
         for key in list(data):
-            if key in DEFAULTS["physics"] or key == "drag":
+            if key in DEFAULTS["physics"] or key in ("drag", "alb_ice"):
                 physics.setdefault(key, data.pop(key))
 
     physics = user.get("physics")
@@ -347,6 +376,12 @@ def _normalize_user_config(user):
         physics.setdefault("drag_ocean_atmosphere", drag)
         physics.setdefault("drag_land_atmosphere", drag)
         physics.setdefault("surface_drag_form", "linear")
+    if isinstance(physics, dict) and "alb_ice" in physics:
+        # The constant sea-ice albedo became temperature dependent; an
+        # explicit legacy value keeps it constant.
+        albedo = physics.pop("alb_ice")
+        physics.setdefault("alb_ice_cold", albedo)
+        physics.setdefault("alb_ice_melt", albedo)
     return user
 
 

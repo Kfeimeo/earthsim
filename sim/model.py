@@ -8,7 +8,8 @@ from .backend import init_backend, to_cpu
 from .data_loader import RealDataError, load_real_initialization
 from .physics import (Ops, qsat, insolation, A_EARTH,
                       SIGMA, CP, LV, RD, RHO_A, MCOL,
-                      RHO_W, CW, C_LAND)
+                      RHO_W, CW, C_LAND, daylight_mean_cos_zenith,
+                      ocean_direct_albedo, snow_direct_albedo)
 from .primitive import (validate_sigma_interfaces, sigma_to_hybrid,
                         generate_hybrid_coefficients,
                         validate_hybrid_coefficients,
@@ -409,6 +410,7 @@ class EarthModel:
         self._initial_mslp_hpa = xp.full_like(
             z, float(ic.real_default_mslp_hpa))
         self._sync_surface_views()
+        self._init_snow()
         self._diag_surface()
         self._maybe_apply_real_initialization()
         if self._primitive_enabled:
@@ -509,6 +511,7 @@ class EarthModel:
             float(self.cfg.physics.sea_ice.full_cover_mass_kg_m2))
         self.initialization_source = "real"
         self._sync_surface_views()
+        self._init_snow()
         self._diag_surface()
 
     def _init_primitive_state(self):
@@ -953,9 +956,23 @@ class EarthModel:
         """
         xp, p, dt = self.xp, self.cfg.physics, self.dt
         capacity = float(p.ground_water_capacity_mm)
+        liquid = self.land * precipitation_mm
+        if self._snow_enabled():
+            # Snowfall builds the snow pack; snowmelt of the last surface
+            # update and snow above max_mm (glacier flow) enter as water.
+            sp = p.snow
+            snow_fraction = xp.clip(
+                (float(sp.rain_snow_temp_k) - self.Ta)
+                / max(float(sp.rain_snow_width_k), 1e-6) + 0.5, 0.0, 1.0)
+            snowfall = liquid * snow_fraction
+            snow = self.snow_mass + snowfall
+            glacier_flow = xp.maximum(snow - float(sp.max_mm), 0.0)
+            self.snow_mass = (snow - glacier_flow).astype(xp.float32)
+            liquid = liquid - snowfall + glacier_flow + self._snowmelt_mm
+            self._snowmelt_mm = xp.zeros_like(self._snowmelt_mm)
         water = xp.maximum(
             self.ground_water
-            + self.land * precipitation_mm
+            + liquid
             - dt * land_evap,
             0,
         )
@@ -1131,17 +1148,79 @@ class EarthModel:
         return au, av
 
     # ------------------------------------------------------------
-    def _shortwave_albedo(self, surface_albedo):
-        """Use the same absorbed sunlight on the ice tile and in the column."""
+    def _solar_mu(self, sunlight, decl_deg):
+        """Cosine of the solar zenith angle for the albedo of this step.
+
+        With the diurnal cycle it follows from the instantaneous insolation
+        S0 * mu; otherwise the daylight-mean value is used.
+        """
         xp, p = self.xp, self.cfg.physics
-        cloud = p.alb_cloud * self.cloud
-        limit = float(p.radiation_transfer.albedo_max)
-        combined = xp.clip(surface_albedo + cloud, 0, limit)
-        if not (p.ice_albedo and p.sea_ice.enabled):
-            return combined
-        water = xp.clip(p.alb_ocean + cloud, 0, limit)
-        ice = xp.clip(p.alb_ice + cloud, 0, limit)
-        return xp.where(self.ocean > .5, water + self.ice * (ice - water), combined)
+        if bool(p.diurnal_cycle):
+            return xp.clip(sunlight / max(float(p.S0), 1e-6), 0.0, 1.0)
+        return daylight_mean_cos_zenith(xp, self.ops.lat, decl_deg)
+
+    def _sea_ice_albedo(self):
+        """Diffuse sea-ice albedo from the ice skin temperature.
+
+        Cold, snow-covered ice reflects alb_ice_cold; within
+        ice_albedo_transition_k of the melting point it falls linearly to
+        the bare/ponded value alb_ice_melt.
+        """
+        xp, p = self.xp, self.cfg.physics
+        cold, melt = float(p.alb_ice_cold), float(p.alb_ice_melt)
+        width = max(float(p.ice_albedo_transition_k), 1e-6)
+        melting = float(_np.float32(p.sea_ice.freezing_temp_k))
+        skin = (self.ice_skin_temp if p.sea_ice.enabled
+                else xp.minimum(self.Ts, melting))
+        warm = xp.clip((skin - (melting - width)) / width, 0.0, 1.0)
+        return cold - (cold - melt) * warm
+
+    def _cloudy_albedo(self, clear_albedo, diffuse_albedo):
+        """Albedo of a surface below partial cloud, with multiple reflection.
+
+        The clear fraction absorbs 1 - a_clear of the direct beam. Below a
+        cloud of reflectance a_c the surface absorbs
+        (1 - a_c)(1 - a_s) / (1 - a_c a_s) of the light reaching the cloud,
+        a_s being the diffuse surface albedo, so clouds shade bright
+        surfaces much less than they shade dark ones.
+        """
+        xp, p = self.xp, self.cfg.physics
+        a_c, c = float(p.alb_cloud), self.cloud
+        absorbed = ((1 - c) * (1 - clear_albedo)
+                    + c * (1 - a_c) * (1 - diffuse_albedo)
+                    / (1 - a_c * diffuse_albedo))
+        return xp.clip(1 - absorbed, 0.0,
+                       float(p.radiation_transfer.albedo_max))
+
+    def _shortwave_albedo(self, mu):
+        """Return (cell albedo, sea-ice tile albedo) for this step.
+
+        ``1 - albedo`` is the fraction of the sunlight reaching the surface
+        that the surface absorbs, cloud included. Water uses the zenith-
+        dependent direct-beam albedo under clear sky and alb_ocean as its
+        diffuse value; snow and ice brighten at low sun. Open water and the
+        sea-ice tile are combined after the cloud effect, so the ice skin
+        balance sees the same absorbed sunlight as the column.
+        """
+        xp, p = self.xp, self.cfg.physics
+        zenith_factor = float(p.snow_zenith_factor)
+        water_diffuse = float(p.alb_ocean)
+        water_clear = (ocean_direct_albedo(xp, mu)
+                       if bool(p.ocean_albedo_zenith) else water_diffuse)
+        water = self._cloudy_albedo(water_clear, water_diffuse)
+        ice_diffuse = self._sea_ice_albedo()
+        ice = self._cloudy_albedo(
+            snow_direct_albedo(xp, ice_diffuse, mu, zenith_factor),
+            ice_diffuse)
+        ocean = water + self.ice * (ice - water)
+
+        bare = float(p.alb_land)
+        snow_diffuse = xp.where(self.ice_sheet > 0.5,
+                                float(p.alb_ice_sheet), float(p.alb_snow))
+        snow_clear = snow_direct_albedo(xp, snow_diffuse, mu, zenith_factor)
+        land = self._cloudy_albedo(bare + self.snow * (snow_clear - bare),
+                                   bare + self.snow * (snow_diffuse - bare))
+        return self.ocean * ocean + self.land * land, ice
 
     def _ice_thickness(self):
         """Mean thickness over the ice-covered fraction, metres (zero off ice)."""
@@ -1155,7 +1234,8 @@ class EarthModel:
         return xp.where(area > 0, self.sea_ice_mass /
                         (density * xp.where(area > 0, area, 1)), 0).astype(xp.float32)
 
-    def _ice_surface_fluxes(self, Ts, air, transfer, sunlight, down_lw, water_lw):
+    def _ice_surface_fluxes(self, Ts, air, transfer, sunlight, down_lw, water_lw,
+                            ice_albedo=None):
         """Zero-layer ice: balance surface exchange against k*(Tf-Tskin)/h.
 
         Fluxes returned to the atmosphere are grid means. At a cold ice
@@ -1175,9 +1255,8 @@ class EarthModel:
         conductance = k / xp.where(h > 0, h, 1)
         base = float(_np.float32(cfg.freezing_temp_k))
         emiss = float(rt.surface_emissivity) * SIGMA if p.radiation else 0.0
-        sw_ice = (sunlight * float(rt.surface_sw_fraction)
-                  * (1 - xp.clip(p.alb_ice + p.alb_cloud * self.cloud,
-                                 0, float(rt.albedo_max)))) if p.radiation else 0.0
+        sw_ice = (sunlight * float(rt.surface_sw_fraction) * (1 - ice_albedo)
+                  if p.radiation else 0.0)
         # Monotone surface balance; Newton from the melting point. Cap at
         # melting so positive residual energy is retained for phase change.
         skin = xp.full_like(Ts, base)
@@ -1186,6 +1265,9 @@ class EarthModel:
                         - transfer * (skin - air) + conductance * (base - skin))
             skin = xp.minimum(base, skin + residual /
                               (conductance + transfer + 4 * emiss * skin**3))
+        # Kept for the temperature-dependent sea-ice albedo of the next step.
+        self.ice_skin_temp = xp.where(self.ocean > 0.5, skin,
+                                      base).astype(xp.float32)
         area = self.ice
         return (water_lw + area * (emiss * skin**4 - water_lw),
                 sensible + area * transfer * (skin - Ts))
@@ -1231,8 +1313,80 @@ class EarthModel:
         self.ice = xp.where(ocean, xp.clip(mass / cover_mass, 0, 1),
                             0.0).astype(xp.float32)
 
+    def _snow_enabled(self):
+        p = self.cfg.physics
+        return bool(p.ice_albedo) and bool(p.snow.enabled)
+
+    def _ice_sheet_mask(self):
+        """1 on Antarctic and Greenland land cells (permanent ice sheets)."""
+        xp, p = self.xp, self.cfg.physics
+        cfg = p.ice_sheet
+        if not bool(cfg.enabled):
+            return xp.zeros_like(self.land, dtype=xp.float32)
+        lat = xp.asarray(self.lats, dtype=xp.float32)[:, None]
+        lon = xp.asarray(_np.asarray(self.lons) % 360.0,
+                         dtype=xp.float32)[None, :]
+        antarctic = lat <= float(cfg.antarctic_lat_max)
+        greenland = ((lat >= float(cfg.greenland_lat_min))
+                     & (lon >= float(cfg.greenland_lon_min))
+                     & (lon <= float(cfg.greenland_lon_max))
+                     & (self.elev >= float(cfg.greenland_min_elevation_m)))
+        return ((self.land > 0.5) & (antarctic | greenland)).astype(xp.float32)
+
+    def _init_snow(self):
+        """Ice-sheet mask, initial snow pack and initial sea-ice skin.
+
+        Without snow observations the initial pack is initial_mm scaled by
+        the old temperature diagnostic, so cold land starts snow covered.
+        """
+        xp, p = self.xp, self.cfg.physics
+        bounds = p.bounds
+        self.ice_sheet = self._ice_sheet_mask()
+        cold = xp.clip((float(bounds.snow_threshold_k) - self.Ts)
+                       / float(bounds.snow_transition_k), 0.0, 1.0)
+        self.snow_mass = (self.land * (1 - self.ice_sheet) * cold
+                          * float(p.snow.initial_mm)).astype(xp.float32)
+        self._snowmelt_mm = xp.zeros_like(self.snow_mass)
+        self._init_ice_skin()
+
+    def _init_ice_skin(self):
+        """Start the ice skin at the lowest-air temperature, capped at melting."""
+        xp = self.xp
+        melting = float(_np.float32(self.cfg.physics.sea_ice.freezing_temp_k))
+        self.ice_skin_temp = xp.where(
+            self.ocean > 0.5, xp.minimum(self.T_layers[0], melting),
+            melting).astype(xp.float32)
+
+    def _melt_snow(self):
+        """Melt snow with the land heat above melt_temp_k, conserving energy.
+
+        C_LAND (Ts - Tm) melts up to the whole pack; the melt water reaches
+        the ground water at the next update. Ice-sheet surfaces stay at the
+        melting point: heat beyond the pack melts glacier ice, whose water
+        is not part of the tracked budget.
+        """
+        xp, p = self.xp, self.cfg.physics
+        melt_temp = float(p.snow.melt_temp_k)
+        latent = float(p.sea_ice.latent_heat_j_kg)
+        land = self.land > 0.5
+        excess = xp.maximum(self.Ts - melt_temp, 0.0) * C_LAND
+        melt = xp.where(land, xp.minimum(excess / latent, self.snow_mass), 0.0)
+        self.snow_mass = (self.snow_mass - melt).astype(xp.float32)
+        Ts = self.Ts - melt * (latent / C_LAND)
+        Ts = xp.where(land & (self.ice_sheet > 0.5),
+                      xp.minimum(Ts, melt_temp), Ts)
+        self.Ts = Ts.astype(xp.float32)
+        self._snowmelt_mm = (self._snowmelt_mm + melt).astype(xp.float32)
+
+    def _snow_cover(self):
+        """Snow cover fraction: SWE / full_cover_mm, always 1 on ice sheets."""
+        xp = self.xp
+        full = max(float(self.cfg.physics.snow.full_cover_mm), 1e-6)
+        cover = xp.clip(self.snow_mass / full, 0.0, 1.0)
+        return (self.land * xp.maximum(cover, self.ice_sheet)).astype(xp.float32)
+
     def _diag_surface(self):
-        """Advance sea-ice phase equilibrium; diagnose land snow from temperature."""
+        """Advance sea-ice and snow phase changes; update ice/snow cover."""
         xp, p = self.xp, self.cfg.physics
         if p.ice_albedo:
             bounds = p.bounds
@@ -1244,11 +1398,15 @@ class EarthModel:
                     / float(bounds.sea_ice_transition_k),
                     float(bounds.cloud_min), float(bounds.cloud_max))
                             ).astype(xp.float32)
-            self.snow = (self.land *
-                         xp.clip((float(bounds.snow_threshold_k) - self.Ts)
-                                 / float(bounds.snow_transition_k),
-                                 float(bounds.cloud_min),
-                                 float(bounds.cloud_max))).astype(xp.float32)
+            if self._snow_enabled():
+                self._melt_snow()
+                self.snow = self._snow_cover()
+            else:  # legacy: snow cover diagnosed from the surface temperature
+                self.snow = (self.land *
+                             xp.clip((float(bounds.snow_threshold_k) - self.Ts)
+                                     / float(bounds.snow_transition_k),
+                                     float(bounds.cloud_min),
+                                     float(bounds.cloud_max))).astype(xp.float32)
         else:
             self.ice = xp.zeros_like(self.Ts)
             self.snow = xp.zeros_like(self.Ts)
@@ -1484,13 +1642,10 @@ class EarthModel:
         self.subsolar = (float(decl), float(sub_lon))
         greenhouse_q = xp.clip(
             low_q / float(sf.humidity_greenhouse_scale), 0, 1)
+        ice_albedo = None
         if p.radiation:
-            albedo_surface = (
-                self.ocean * (p.alb_ocean * (1 - self.ice)
-                              + p.alb_ice * self.ice)
-                + self.land * (p.alb_land * (1 - self.snow)
-                               + p.alb_snow * self.snow))
-            albedo = self._shortwave_albedo(albedo_surface)
+            albedo, ice_albedo = self._shortwave_albedo(
+                self._solar_mu(Q_sw, decl))
             SW_surface = (
                 Q_sw * (1 - albedo) * float(rt.surface_sw_fraction))
             SW_air = (
@@ -1516,7 +1671,7 @@ class EarthModel:
             RD * low_T * (1.0 + 0.608 * low_q), 1.0)
         LW_up, sensible = self._ice_surface_fluxes(
             Ts, low_T, float(sf.sensible_heat_coeff) * density0 * CP * wind,
-            Q_sw, LW_down, LW_up)
+            Q_sw, LW_down, LW_up, ice_albedo)
         if p.moisture:
             evaporation, land_evaporation = self._surface_evaporation(
                 Ts, low_q, wind, low_p, low_T)
@@ -1816,10 +1971,9 @@ class EarthModel:
                      float(bounds.relative_humidity_max))
         gq = xp.clip(q / float(sf.humidity_greenhouse_scale), 0, 1)
 
+        ice_albedo = None
         if p.radiation:
-            alb_sfc = (self.ocean * (p.alb_ocean * (1 - self.ice) + p.alb_ice * self.ice)
-                       + self.land * (p.alb_land * (1 - self.snow) + p.alb_snow * self.snow))
-            alb = self._shortwave_albedo(alb_sfc)
+            alb, ice_albedo = self._shortwave_albedo(self._solar_mu(Q_sw, decl))
             SW_sfc = Q_sw * (1 - alb) * float(rt.surface_sw_fraction)
             SW_air = (Q_sw * (1 - float(rt.cloud_sw_absorption) * self.cloud)
                       * float(rt.air_sw_fraction))
@@ -1841,7 +1995,7 @@ class EarthModel:
         # ============ 地表通量 ============
         LW_up, SH = self._ice_surface_fluxes(
             Ts, Ta, float(sf.sensible_heat_coeff) * RHO_A * CP * spd,
-            Q_sw, LW_dn, LW_up)
+            Q_sw, LW_dn, LW_up, ice_albedo)
         if p.moisture:
             E, land_E = self._surface_evaporation(Ts, q, spd)
             LE = LV * E
@@ -1967,12 +2121,9 @@ class EarthModel:
                                          p.S0, p.diurnal_cycle)
         self.subsolar = (float(decl), float(sub_lon))
         gq = xp.clip(q0 / float(sf.humidity_greenhouse_scale), 0, 1)
+        ice_albedo = None
         if p.radiation:
-            alb_sfc = (self.ocean * (p.alb_ocean * (1 - self.ice)
-                       + p.alb_ice * self.ice)
-                       + self.land * (p.alb_land * (1 - self.snow)
-                       + p.alb_snow * self.snow))
-            alb = self._shortwave_albedo(alb_sfc)
+            alb, ice_albedo = self._shortwave_albedo(self._solar_mu(Q_sw, decl))
             SW_sfc = Q_sw * (1 - alb) * float(rt.surface_sw_fraction)
             SW_air = (Q_sw * (1 - float(rt.cloud_sw_absorption) * self.cloud)
                       * float(rt.air_sw_fraction))
@@ -1993,7 +2144,7 @@ class EarthModel:
 
         LW_up, SH = self._ice_surface_fluxes(
             Ts, Ta0, float(sf.sensible_heat_coeff) * RHO_A * CP * spd,
-            Q_sw, LW_dn, LW_up)
+            Q_sw, LW_dn, LW_up, ice_albedo)
         if p.moisture:
             E, land_E = self._surface_evaporation(Ts, q0, spd)
             LE = LV * E
@@ -2144,7 +2295,8 @@ class EarthModel:
             self.Ts = xp.clip(
                 self.Ts + dT, float(bounds.surface_temp_min_k),
                 float(bounds.surface_temp_max_k)).astype(xp.float32)
-            if self.cfg.physics.sea_ice.enabled and self.cfg.physics.ice_albedo:
+            if ((self.cfg.physics.sea_ice.enabled and self.cfg.physics.ice_albedo)
+                    or self._snow_enabled()):
                 self._diag_surface()
             # Legacy temperature-based melting when latent heat is disabled.
             if float(delta) > 0:
@@ -2153,11 +2305,12 @@ class EarthModel:
                                float(bounds.cloud_min), float(bounds.cloud_max))
                 if not self.cfg.physics.sea_ice.enabled:
                     self.ice = xp.minimum(self.ice, 1 - melt * self.ocean)
-                melt_l = xp.clip((self.Ts - float(bounds.snow_threshold_k))
-                                 / float(bounds.snow_transition_k),
-                                 float(bounds.cloud_min),
-                                 float(bounds.cloud_max))
-                self.snow = xp.minimum(self.snow, 1 - melt_l * self.land)
+                if not self._snow_enabled():
+                    melt_l = xp.clip((self.Ts - float(bounds.snow_threshold_k))
+                                     / float(bounds.snow_transition_k),
+                                     float(bounds.cloud_min),
+                                     float(bounds.cloud_max))
+                    self.snow = xp.minimum(self.snow, 1 - melt_l * self.land)
         if target in ("air", "both"):
             old_T = self.T_layers[0].copy()
             self.T_layers[0] = xp.clip(
@@ -2261,6 +2414,7 @@ class EarthModel:
             "river_flow": to_cpu(self.river_flow),
             "ice": to_cpu(self.xp.maximum(self.ice, self.snow)),
             "sea_ice_mass": to_cpu(self.sea_ice_mass),
+            "snow_mass": to_cpu(self.snow_mass),
             "sea_ice_thickness_m": to_cpu(self._ice_thickness()),
             "u": to_cpu(self.u), "v": to_cpu(self.v),
             "w": to_cpu(self.w),
@@ -2338,6 +2492,13 @@ class EarthModel:
         self.cloud, self.precip = state["cloud"], state["precip"]
         self.ground_water = state["ground_water"]
         self.runoff, self.river_flow = state["runoff"], state["river_flow"]
+        if "snow_mass" in fields:
+            self.snow_mass = xp.maximum(load("snow_mass", shape2),
+                                        0.0) * self.land
+            self._snowmelt_mm = xp.zeros(shape2, f32)
+            self._init_ice_skin()
+        else:  # frames written before the prognostic snow pack
+            self._init_snow()
 
         self.w_layers = xp.zeros(shape3, f32)
         self.omega_layers = xp.zeros(shape3, f32)

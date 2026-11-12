@@ -6,15 +6,15 @@
 backend: cuda            # auto | cuda | cpu
 
 grid:
-  nlat: 180              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
-  nlon: 360           # usually nlat*2
+  nlat: 360              # 90 (2 deg), 180 (1 deg), 360 (0.5 deg)
+  nlon: 720           # usually nlat*2
   topo_file: data/etopo2022_60s.npz
   topo_files:
     - data/etopo2022_60s.npz
     - data/etopo20.npz
 
 time:
-  dt: 100
+  dt: 30
   start: "2026-05-01T00:00:00"
   spinup_days: 0
 
@@ -94,12 +94,43 @@ physics:
 
   # Shortwave and surface albedo
   S0: 1361.0
-  alb_ocean: 0.07
+  # Cloud and surface combine with multiple reflection:
+  #   absorbed = (1-c)(1-a_clear) + c (1-a_cloud)(1-a_diffuse)/(1-a_cloud a_diffuse)
+  # Clear sky sees the direct-beam albedo (zenith dependent), cloudy sky the
+  # diffuse one.
+  alb_ocean: 0.07                 # diffuse water; direct beam via Briegleb
+  ocean_albedo_zenith: true
   alb_land: 0.22
-  alb_ice: 0.62
-  alb_snow: 0.70
+  alb_ice_cold: 0.75              # snow-covered sea ice, skin < Tf - 1 K
+  alb_ice_melt: 0.50              # bare / ponded sea ice at the melting point
+  ice_albedo_transition_k: 1.0
+  alb_snow: 0.70                  # seasonal land snow
+  alb_ice_sheet: 0.80             # Greenland / Antarctica
   alb_cloud: 0.42
+  snow_zenith_factor: 0.4         # low-sun brightening of snow/ice (0 = off)
   tau_relax_T: 864000.0
+
+  # Prognostic land snow (SWE in mm = kg/m2): snowfall from the rain/snow
+  # split of precipitation, energy-conserving melt at melt_temp_k, cover =
+  # SWE / full_cover_mm.
+  snow:
+    enabled: true
+    full_cover_mm: 10.0
+    rain_snow_temp_k: 274.15      # 50 % snow; all snow < 0 C, all rain > 2 C
+    rain_snow_width_k: 2.0
+    melt_temp_k: 273.15
+    max_mm: 1000.0                # excess runs off (glacier flow)
+    initial_mm: 100.0             # initial SWE where the surface is cold
+
+  # Permanent ice sheets: always snow covered with alb_ice_sheet; the surface
+  # is capped at the melting point (glacier melt is not tracked as water).
+  ice_sheet:
+    enabled: true
+    antarctic_lat_max: -60.0
+    greenland_lat_min: 59.0
+    greenland_lon_min: 286.0      # 74 W
+    greenland_lon_max: 349.0      # 11 W
+    greenland_min_elevation_m: 500.0
 
   # Moist convection, clouds, and land water
   rh_crit: 0.85
@@ -196,7 +227,7 @@ physics:
     relative_humidity_max: 1.3
 
   radiation_transfer:
-    albedo_max: 0.85
+    albedo_max: 0.90
     surface_sw_fraction: 0.80
     cloud_sw_absorption: 0.30
     air_sw_fraction: 0.18

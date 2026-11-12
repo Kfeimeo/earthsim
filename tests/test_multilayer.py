@@ -132,6 +132,7 @@ class MultilayerModelTests(unittest.TestCase):
         model.land[...] = 1.0
         model.ocean[...] = 0.0
         model.ground_water[...] = 10.0
+        model.Ta[...] = 290.0  # warm air: all precipitation falls as rain
         land_evap = np.full_like(model.ground_water, 0.001)
         rain = np.full_like(model.ground_water, 2.0)
 

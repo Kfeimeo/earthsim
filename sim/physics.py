@@ -288,3 +288,39 @@ def insolation(xp, lat_rad, lon_rad, t_utc, S0, diurnal=True):
                              + xp.cos(lat_rad) * _np.cos(decl) * xp.sin(h0))
         Q = Q * xp.ones_like(lam)
     return Q.astype(xp.float32), _np.degrees(decl), sub_lon
+
+
+def daylight_mean_cos_zenith(xp, lat_rad, decl_deg):
+    """Daylight-mean cosine of the solar zenith angle (no diurnal cycle).
+
+    The daily-mean insolation is S0/pi * N with N = h0 sin(lat) sin(decl) +
+    cos(lat) cos(decl) sin(h0); dividing by the daylight fraction h0/pi gives
+    the mean cos(zenith) while the sun is up, N / h0. Zero in polar night.
+    """
+    decl = _np.radians(float(decl_deg))
+    h0 = xp.arccos(xp.clip(-xp.tan(lat_rad) * _np.tan(decl), -1, 1))
+    n = (h0 * xp.sin(lat_rad) * _np.sin(decl)
+         + xp.cos(lat_rad) * _np.cos(decl) * xp.sin(h0))
+    return xp.where(h0 > 1e-6, n / xp.maximum(h0, 1e-6), 0.0).astype(xp.float32)
+
+
+def ocean_direct_albedo(xp, mu):
+    """Direct-beam open-water albedo vs. cos(zenith) (Briegleb et al. 1986).
+
+    About 0.024 with the sun overhead, 0.07 at 60 deg and ~0.4 near the
+    horizon.
+    """
+    mu = xp.clip(mu, 0.0, 1.0)
+    albedo = (0.026 / (mu ** 1.7 + 0.065)
+              + 0.15 * (mu - 0.1) * (mu - 0.5) * (mu - 1.0))
+    return xp.clip(albedo, 0.0, 1.0)
+
+
+def snow_direct_albedo(xp, diffuse_albedo, mu, factor):
+    """Direct-beam snow/ice albedo: brighter at low sun (Dickinson et al. 1993).
+
+    f(mu) = 1.5 / (1 + 4 mu) - 0.5 (b = 2) is zero for mu >= 0.5 and one
+    at the horizon; the albedo rises by ``factor * f * (1 - diffuse)``.
+    """
+    f = xp.clip(1.5 / (1.0 + 4.0 * xp.clip(mu, 0.0, 1.0)) - 0.5, 0.0, 1.0)
+    return diffuse_albedo + float(factor) * f * (1.0 - diffuse_albedo)
